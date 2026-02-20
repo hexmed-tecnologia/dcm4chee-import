@@ -88,15 +88,16 @@ Write-Log "INFO" "Iniciando envio para $aetDestino..."
 if ($arquivoLogCompleto) {
     Write-Log "INFO" "Log de execucao sera salvo em: $arquivoLogCompleto"
 }
+Write-Log "INFO" "Para cancelar: Ctrl+C. Emergencia: taskkill /F /T /IM java.exe"
 Write-Log "DEBUG" "storescu path: $storescuPath"
 Write-Log "DEBUG" "storescu args: $($storescuArgs -join ' ')"
 
-$linhas = @()
+# Garante criacao/limpeza do arquivo de log antes de iniciar.
+New-Item -ItemType File -Path $arquivoLogCompleto -Force | Out-Null
 if ($mostrarOutputEmTempoReal) {
-    $linhas = & $storescuPath @storescuArgs 2>&1 | Tee-Object -FilePath $arquivoLogCompleto
+    & $storescuPath @storescuArgs 2>&1 | Tee-Object -FilePath $arquivoLogCompleto
 } else {
-    $linhas = & $storescuPath @storescuArgs 2>&1 | Tee-Object -FilePath $arquivoLogCompleto
-    $linhas | Out-Null
+    & $storescuPath @storescuArgs 2>&1 | Tee-Object -FilePath $arquivoLogCompleto | Out-Null
 }
 
 $exitCode = $LASTEXITCODE
@@ -107,7 +108,10 @@ if ($exitCode -ne 0) {
     Write-Log "WARN" "storescu finalizou com exit code $exitCode (validando mesmo assim pelo log DICOM)."
 }
 
-$resultado = ($linhas -join [Environment]::NewLine)
+$resultado = ""
+if (Test-Path $arquivoLogCompleto) {
+    $resultado = Get-Content -Path $arquivoLogCompleto -Raw -ErrorAction SilentlyContinue
+}
 
 # 5. Filtragem por Regex
 $regexSucesso = "status=0H[\s\S]*?iuid=([\d\.]+)"
@@ -117,6 +121,10 @@ $sucessos = [regex]::Matches($resultado, $regexSucesso, [System.Text.RegularExpr
     ForEach-Object { $_.Groups[1].Value }
 $erros = [regex]::Matches($resultado, $regexErro, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) |
     ForEach-Object { $_.Groups[1].Value }
+
+if ($sucessos.Count -eq 0 -and $erros.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultado)) {
+    Write-Log "WARN" "Nenhum IUID foi extraido pelo regex. Verifique formato do log em: $arquivoLogCompleto"
+}
 
 # 6. Persistencia dos resultados
 $sucessos | Out-File -FilePath $arquivoSucesso -Encoding utf8
