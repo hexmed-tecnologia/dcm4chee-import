@@ -1,0 +1,6 @@
+artifacts/
+**/artifacts/
+__pycache__/
+**/__pycache__/
+dcm4che-5.34.2/
+**/dcm4che-5.34.2/
