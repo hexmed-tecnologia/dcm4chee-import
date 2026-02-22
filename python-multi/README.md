@@ -21,6 +21,9 @@ Aplicacao desktop em Tkinter para fluxo DICOM com dois toolkits:
 2. Revisar dashboard de analise.
 3. Rodar `Send` por `run_id`.
 4. Rodar `Validacao` manualmente por `run_id`.
+5. Opcional: na aba `Validacao`, usar `Exportar relatorio completo` com modo:
+   - `A - por arquivo`
+   - `C - por StudyUID`
 
 ## Artefatos por run
 
@@ -37,23 +40,50 @@ Aplicacao desktop em Tkinter para fluxo DICOM com dois toolkits:
 - `consistency_events.csv`
 - `validation_by_iuid.csv`
 - `validation_by_file.csv`
+- `validation_full_report_A.csv` (quando exportado no modo A)
+- `validation_full_report_C.csv` (quando exportado no modo C)
 - `reconciliation_report.csv`
+
+## Relatorio completo (Validacao)
+
+Campos principais exportados:
+
+- `nome_paciente`
+- `prontuario`
+- `accession_number`
+- `sexo`
+- `data_exame`
+- `descricao_exame`
+- `study_uid`
+- `status` (`OK` quando IUID encontrado no dcm4chee, `ERRO` quando nao encontrado ou com falha de consulta)
 
 ## Configuracao
 
 No menu `Configuracao -> Configuracoes`:
 
 - Toolkit ativo (`dcm4che` ou `dcmtk`)
-- Caminho do binario `dcm4che` (opcional, se usar toolkit externo)
-- Caminho do binario `dcmtk` (opcional, se usar toolkit externo)
 - AET origem, AET destino
 - Host e porta do PACS
 - Host REST para validacao
 - Tamanho de batch
 - Regras de indexacao por extensao
+- Opcao de calcular `size_bytes` na analise (desative para melhorar performance em arvores muito grandes)
 - Modo TS (`AUTO`, `JPEG_LS_LOSSLESS`, `UNCOMPRESSED_STANDARD`)
 
 Observacao: nesta versao, apenas `AUTO` esta ativo. Os demais modos estao estruturados para evolucao futura.
+As toolkits sao sempre resolvidas internamente em `toolkits/<nome>-*/bin` relativo ao app (sem configuracao manual de path).
+
+Durante a analise, o log pode exibir marcadores `[AN_SCAN_PROGRESS]` com taxa de varredura e ETA aproximado.
+O dashboard da aba `Analise` tambem exibe um indicador visual de progresso com ETA aproximado em tempo real.
+No menu principal ha um item `Sobre` que mostra a versao atual da aplicacao.
+
+## Versionamento
+
+- Arquivo fonte de versao: `VERSION` (na raiz de `python-multi`)
+- Versao inicial: `v1.0.0`
+- A janela principal exibe a versao na barra de titulo (`DICOM Multi Toolkit - vX.Y.Z`)
+- O menu `Sobre` exibe a mesma versao
+- Todo build via `build-scripts\build_onedir.bat` le a versao desse arquivo automaticamente
 
 ## Politica de timestamp
 

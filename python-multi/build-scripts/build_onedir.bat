@@ -4,6 +4,7 @@ setlocal enableextensions
 set "SCRIPT_DIR=%~dp0"
 set "PROJECT_DIR=%SCRIPT_DIR%.."
 set "APP_FILE=%PROJECT_DIR%\app.py"
+set "VERSION_FILE=%PROJECT_DIR%\VERSION"
 set "APP_NAME=DicomMultiToolkit"
 set "TOOLKITS_DIR=%PROJECT_DIR%\toolkits"
 
@@ -15,6 +16,15 @@ set "SPEC_DIR=%ARTIFACTS_DIR%\spec"
 
 if not exist "%ARTIFACTS_DIR%" mkdir "%ARTIFACTS_DIR%"
 if not exist "%DIST_ROOT%" mkdir "%DIST_ROOT%"
+if not exist "%VERSION_FILE%" (
+  echo [ERROR] Arquivo VERSION nao encontrado: %VERSION_FILE%
+  exit /b 1
+)
+set /p APP_VERSION=<"%VERSION_FILE%"
+if "%APP_VERSION%"=="" (
+  echo [ERROR] Arquivo VERSION vazio: %VERSION_FILE%
+  exit /b 1
+)
 
 py -3.12 -V >nul 2>&1
 if errorlevel 1 (
@@ -43,6 +53,7 @@ set "DIST_DIR=%DIST_ROOT%\%BUILD_STAMP%"
 mkdir "%DIST_DIR%"
 
 echo [INFO] Build timestamp: %BUILD_STAMP%
+echo [INFO] App version: %APP_VERSION%
 echo [INFO] Dist output: %DIST_DIR%
 
 if exist "%TOOLKITS_DIR%" (
@@ -52,6 +63,7 @@ if exist "%TOOLKITS_DIR%" (
     --onedir ^
     --windowed ^
     --name "%APP_NAME%" ^
+    --add-data "%VERSION_FILE%;." ^
     --add-data "%TOOLKITS_DIR%;toolkits" ^
     --distpath "%DIST_DIR%" ^
     --workpath "%BUILD_DIR%" ^
@@ -64,6 +76,7 @@ if exist "%TOOLKITS_DIR%" (
     --onedir ^
     --windowed ^
     --name "%APP_NAME%" ^
+    --add-data "%VERSION_FILE%;." ^
     --distpath "%DIST_DIR%" ^
     --workpath "%BUILD_DIR%" ^
     --specpath "%SPEC_DIR%" ^

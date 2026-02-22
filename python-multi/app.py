@@ -6,6 +6,7 @@ import queue
 import re
 import subprocess
 import threading
+import time
 import tkinter as tk
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -16,6 +17,7 @@ from urllib import request as urlrequest
 
 
 CSV_SEP = ";"
+APP_DISPLAY_NAME = "DICOM Multi Toolkit"
 
 DCM4CHE_SUCCESS_REGEX = re.compile(r"status=0H[\s\S]*?iuid=([\d\.]+)", re.IGNORECASE)
 DCM4CHE_ERROR_REGEX = re.compile(r"status=[^0][A-F0-9]*H[\s\S]*?iuid=([\d\.]+)", re.IGNORECASE)
@@ -40,6 +42,7 @@ def hidden_process_kwargs() -> dict:
 @dataclass
 class AppConfig:
     toolkit: str = "dcm4che"
+    # Internal runtime values (always resolved from local "toolkits" folder).
     dcm4che_bin_path: str = ""
     dcmtk_bin_path: str = ""
     aet_origem: str = "STORESCU"
@@ -52,6 +55,7 @@ class AppConfig:
     nivel_log_minimo: str = "INFO"
     allowed_extensions_csv: str = ".dcm"
     include_no_extension: bool = True
+    collect_size_bytes: bool = True
     ts_mode: str = "AUTO"
     # Internal flag: keep Windows-stable wrapper for .bat execution by default.
     dcm4che_use_shell_wrapper: bool = True
@@ -72,6 +76,35 @@ def now_dual_timestamp() -> tuple[str, str]:
 
 def now_run_id() -> str:
     return datetime.now().strftime("%d%m%Y_%H%M%S")
+
+
+def format_eta(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "calculando"
+    total = int(seconds)
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+class WorkflowCancelled(Exception):
+    pass
+
+
+def read_app_version(base_dir: Path) -> str:
+    candidates = [base_dir / "VERSION", base_dir.parent / "VERSION"]
+    for p in candidates:
+        try:
+            if p.exists():
+                raw = p.read_text(encoding="utf-8", errors="replace").strip()
+                if raw:
+                    return raw
+        except Exception:
+            pass
+    return "v0.0.0-dev"
 
 
 def parse_extensions(value: str) -> set[str]:
@@ -120,11 +153,13 @@ def read_csv_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(f, delimiter=CSV_SEP))
 
 
-def find_first_bin(base_dir: Path, filename: str) -> str:
-    for root, _, files in os.walk(base_dir):
-        if filename in files:
-            return str(Path(root))
-    return ""
+def write_csv_table(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=CSV_SEP)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
 def find_toolkit_bin(base_dir: Path, toolkit_prefix: str, filename: str) -> str:
@@ -138,6 +173,23 @@ def find_toolkit_bin(base_dir: Path, toolkit_prefix: str, filename: str) -> str:
         if (bin_dir / filename).exists():
             return str(bin_dir)
     return ""
+
+
+def apply_internal_toolkit_paths(cfg: AppConfig, base_dir: Path, logger=None) -> AppConfig:
+    dcm4che_bin = find_toolkit_bin(base_dir, "dcm4che", "storescu.bat")
+    dcmtk_bin = find_toolkit_bin(base_dir, "dcmtk", "storescu.exe")
+    cfg.dcm4che_bin_path = dcm4che_bin
+    cfg.dcmtk_bin_path = dcmtk_bin
+    if logger:
+        logger(
+            f"[TOOLKIT_RESOLVE] toolkit=dcm4che source=internal status={'OK' if dcm4che_bin else 'NOT_FOUND'} "
+            f"path={dcm4che_bin or '<missing>'}"
+        )
+        logger(
+            f"[TOOLKIT_RESOLVE] toolkit=dcmtk source=internal status={'OK' if dcmtk_bin else 'NOT_FOUND'} "
+            f"path={dcmtk_bin or '<missing>'}"
+        )
+    return cfg
 
 
 class ToolkitDriver:
@@ -164,6 +216,11 @@ class Dcm4cheDriver(ToolkitDriver):
     toolkit_name = "dcm4che"
 
     def storescu_cmd(self, cfg: AppConfig, batch_files: list[Path], args_file: Path) -> list[str]:
+        if not cfg.dcm4che_bin_path:
+            raise RuntimeError(
+                "storescu.bat nao encontrado na toolkit interna. "
+                "Estrutura esperada: <app>\\toolkits\\dcm4che-*\\bin\\storescu.bat"
+            )
         storescu = Path(cfg.dcm4che_bin_path) / "storescu.bat"
         if not storescu.exists():
             raise RuntimeError(f"storescu.bat nao encontrado: {storescu}")
@@ -179,12 +236,19 @@ class Dcm4cheDriver(ToolkitDriver):
         return base
 
     def echo_cmd(self, cfg: AppConfig) -> list[str]:
+        if not cfg.dcm4che_bin_path:
+            raise RuntimeError(
+                "storescu.bat nao encontrado na toolkit interna. "
+                "Estrutura esperada: <app>\\toolkits\\dcm4che-*\\bin\\storescu.bat"
+            )
         storescu = Path(cfg.dcm4che_bin_path) / "storescu.bat"
         if not storescu.exists():
             raise RuntimeError(f"storescu.bat nao encontrado: {storescu}")
         return ["cmd", "/c", str(storescu), "-c", f"{cfg.aet_destino}@{cfg.pacs_host}:{cfg.pacs_port}"]
 
     def extract_metadata(self, cfg: AppConfig, file_path: Path) -> tuple[str, str, str, str]:
+        if not cfg.dcm4che_bin_path:
+            return "", "", "", "dcmdump.bat nao encontrado na toolkit interna"
         dcmdump = Path(cfg.dcm4che_bin_path) / "dcmdump.bat"
         if not dcmdump.exists():
             return "", "", "", "dcmdump.bat nao encontrado"
@@ -206,6 +270,11 @@ class DcmtkDriver(ToolkitDriver):
     toolkit_name = "dcmtk"
 
     def storescu_cmd(self, cfg: AppConfig, batch_files: list[Path], args_file: Path) -> list[str]:
+        if not cfg.dcmtk_bin_path:
+            raise RuntimeError(
+                "storescu.exe nao encontrado na toolkit interna. "
+                "Estrutura esperada: <app>\\toolkits\\dcmtk-*\\bin\\storescu.exe"
+            )
         storescu = Path(cfg.dcmtk_bin_path) / "storescu.exe"
         if not storescu.exists():
             raise RuntimeError(f"storescu.exe nao encontrado: {storescu}")
@@ -223,12 +292,19 @@ class DcmtkDriver(ToolkitDriver):
         ]
 
     def echo_cmd(self, cfg: AppConfig) -> list[str]:
+        if not cfg.dcmtk_bin_path:
+            raise RuntimeError(
+                "echoscu.exe nao encontrado na toolkit interna. "
+                "Estrutura esperada: <app>\\toolkits\\dcmtk-*\\bin\\echoscu.exe"
+            )
         echoscu = Path(cfg.dcmtk_bin_path) / "echoscu.exe"
         if not echoscu.exists():
             raise RuntimeError(f"echoscu.exe nao encontrado: {echoscu}")
         return [str(echoscu), "-aet", cfg.aet_origem, "-aec", cfg.aet_destino, cfg.pacs_host, str(cfg.pacs_port)]
 
     def extract_metadata(self, cfg: AppConfig, file_path: Path) -> tuple[str, str, str, str]:
+        if not cfg.dcmtk_bin_path:
+            return "", "", "", "dcmdump.exe nao encontrado na toolkit interna"
         dcmdump = Path(cfg.dcmtk_bin_path) / "dcmdump.exe"
         if not dcmdump.exists():
             return "", "", "", "dcmdump.exe nao encontrado"
@@ -274,12 +350,18 @@ def get_driver(toolkit: str) -> ToolkitDriver:
 
 
 class AnalyzeWorkflow:
-    def __init__(self, cfg: AppConfig, logger):
+    def __init__(self, cfg: AppConfig, logger, cancel_event: threading.Event, progress_callback=None):
         self.cfg = cfg
         self.logger = logger
+        self.cancel_event = cancel_event
+        self.progress_callback = progress_callback
 
     def _log(self, msg: str) -> None:
         self.logger(msg)
+
+    def _progress(self, text: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(text)
 
     def _resolve_runs_base(self, script_dir: Path) -> Path:
         if self.cfg.runs_base_dir.strip():
@@ -315,6 +397,11 @@ class AnalyzeWorkflow:
         include_no_ext = bool(self.cfg.include_no_extension)
         self._log(f"RUN_ID analise: {run}")
         self._log("Iniciando descoberta de arquivos...")
+        self._log(
+            f"[AN_SCAN_CONFIG] collect_size_bytes={'ON' if self.cfg.collect_size_bytes else 'OFF'} "
+            "(OFF melhora performance em arvores muito grandes)"
+        )
+        self._progress("progresso analise: preparando varredura...")
 
         folder_agg: dict[str, dict] = {}
         total_files = 0
@@ -337,49 +424,129 @@ class AnalyzeWorkflow:
             "discovered_at",
         ]
         seq = 0
-        for dirpath, _, filenames in os.walk(root):
-            folder = Path(dirpath)
-            for name in filenames:
-                seq += 1
-                p = folder / name
-                try:
-                    size = p.stat().st_size
-                except Exception:
-                    size = 0
-                ext = p.suffix.lower()
-                no_ext = ext == ""
-                include = (ext in allowed_ext) or (no_ext and include_no_ext)
-                reason = "INCLUDED_EXT" if ext in allowed_ext else ("INCLUDED_NO_EXT" if (no_ext and include_no_ext) else "EXCLUDED_EXTENSION")
-                if include:
-                    selected_files += 1
-                    selected_bytes += size
-                    selected_folder_keys.add(str(folder))
-                else:
-                    excluded_files += 1
+        manifest_files.parent.mkdir(parents=True, exist_ok=True)
+        file_output_fields = [*file_fields, "timestamp_br", "timestamp_iso"]
+        progress_interval_sec = 2.0
+        buffer_size = 2000
+        row_buffer: list[dict] = []
+        start_ts = time.monotonic()
+        last_progress_ts = start_ts
+        dirs_processed = 0
+        dirs_discovered = 1
+        dir_stack: list[Path] = [root]
+        scan_errors = 0
 
-                total_files += 1
-                total_bytes += size
+        with manifest_files.open("w", newline="", encoding="utf-8") as f_manifest:
+            manifest_writer = csv.DictWriter(f_manifest, fieldnames=file_output_fields, delimiter=CSV_SEP)
+            manifest_writer.writeheader()
+
+            def flush_manifest_buffer() -> None:
+                if not row_buffer:
+                    return
+                manifest_writer.writerows(row_buffer)
+                row_buffer.clear()
+                f_manifest.flush()
+
+            while dir_stack:
+                if self.cancel_event.is_set():
+                    flush_manifest_buffer()
+                    write_csv_row(
+                        events,
+                        {
+                            "run_id": run,
+                            "timestamp": now_br(),
+                            "event_type": "ANALYSIS_CANCELLED",
+                            "message": f"files_scanned={total_files};dirs_processed={dirs_processed}",
+                        },
+                        ["run_id", "timestamp", "event_type", "message"],
+                    )
+                    raise WorkflowCancelled("Analise cancelada pelo usuario.")
+
+                folder = dir_stack.pop()
+                dirs_processed += 1
                 folder_key = str(folder)
-                agg = folder_agg.setdefault(folder_key, {"count": 0, "bytes": 0})
-                agg["count"] += 1
-                agg["bytes"] += size
+                try:
+                    with os.scandir(folder) as it:
+                        for entry in it:
+                            if entry.is_dir(follow_symlinks=False):
+                                dir_stack.append(Path(entry.path))
+                                dirs_discovered += 1
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
 
-                write_csv_row(
-                    manifest_files,
-                    {
-                        "run_id": run,
-                        "seq": seq,
-                        "file_path": str(p),
-                        "folder_path": folder_key,
-                        "extension": ext,
-                        "size_bytes": size,
-                        "selected_for_send": 1 if include else 0,
-                        "selection_reason": reason,
-                        "dicom_status": "UNKNOWN",
-                        "discovered_at": now_br(),
-                    },
-                    file_fields,
-                )
+                            seq += 1
+                            if self.cfg.collect_size_bytes:
+                                try:
+                                    size = entry.stat(follow_symlinks=False).st_size
+                                except Exception:
+                                    size = 0
+                            else:
+                                size = 0
+
+                            ext = Path(entry.name).suffix.lower()
+                            no_ext = ext == ""
+                            include = (ext in allowed_ext) or (no_ext and include_no_ext)
+                            reason = "INCLUDED_EXT" if ext in allowed_ext else ("INCLUDED_NO_EXT" if (no_ext and include_no_ext) else "EXCLUDED_EXTENSION")
+                            if include:
+                                selected_files += 1
+                                selected_bytes += size
+                                selected_folder_keys.add(folder_key)
+                            else:
+                                excluded_files += 1
+
+                            total_files += 1
+                            total_bytes += size
+                            agg = folder_agg.setdefault(folder_key, {"count": 0, "bytes": 0})
+                            agg["count"] += 1
+                            agg["bytes"] += size
+
+                            ts_br, ts_iso = now_dual_timestamp()
+                            row_buffer.append(
+                                {
+                                    "run_id": run,
+                                    "seq": seq,
+                                    "file_path": entry.path,
+                                    "folder_path": folder_key,
+                                    "extension": ext,
+                                    "size_bytes": size,
+                                    "selected_for_send": 1 if include else 0,
+                                    "selection_reason": reason,
+                                    "dicom_status": "UNKNOWN",
+                                    "discovered_at": ts_br,
+                                    "timestamp_br": ts_br,
+                                    "timestamp_iso": ts_iso,
+                                }
+                            )
+                            if len(row_buffer) >= buffer_size:
+                                flush_manifest_buffer()
+                except Exception as ex:
+                    scan_errors += 1
+                    if scan_errors <= 5:
+                        self._log(f"[WARN] Falha ao escanear pasta: {folder} | erro={ex}")
+
+                now_ts = time.monotonic()
+                if (now_ts - last_progress_ts) >= progress_interval_sec:
+                    flush_manifest_buffer()
+                    elapsed = max(now_ts - start_ts, 0.001)
+                    rate_files = total_files / elapsed
+                    avg_files_per_dir = total_files / max(dirs_processed, 1)
+                    est_total_files = total_files + int(len(dir_stack) * avg_files_per_dir)
+                    remaining_files = max(est_total_files - total_files, 0)
+                    eta_seconds = (remaining_files / rate_files) if rate_files > 0 else None
+                    self._log(
+                        f"[AN_SCAN_PROGRESS] dirs={dirs_processed} pending_dirs={len(dir_stack)} "
+                        f"files={total_files} selected={selected_files} rate={rate_files:.1f} arq/s "
+                        f"eta~{format_eta(eta_seconds)}"
+                    )
+                    self._progress(
+                        f"progresso analise: dirs={dirs_processed} pendentes={len(dir_stack)} "
+                        f"arquivos={total_files} selecionados={selected_files} "
+                        f"taxa={rate_files:.1f} arq/s eta~{format_eta(eta_seconds)}"
+                    )
+                    last_progress_ts = now_ts
+
+            flush_manifest_buffer()
 
         folder_fields = ["run_id", "folder_path", "file_count", "size_bytes", "discovered_at"]
         for folder, agg in sorted(folder_agg.items()):
@@ -411,6 +578,7 @@ class AnalyzeWorkflow:
             "files_excluded",
             "size_total_bytes",
             "size_selected_bytes",
+            "size_collection_enabled",
             "chunk_unit",
             "chunks_total",
             "generated_at",
@@ -429,6 +597,7 @@ class AnalyzeWorkflow:
                 "files_excluded": excluded_files,
                 "size_total_bytes": total_bytes,
                 "size_selected_bytes": selected_bytes,
+                "size_collection_enabled": "1" if self.cfg.collect_size_bytes else "0",
                 "chunk_unit": chunk_unit,
                 "chunks_total": chunk_total,
                 "generated_at": now_br(),
@@ -441,7 +610,11 @@ class AnalyzeWorkflow:
                 "run_id": run,
                 "timestamp": now_br(),
                 "event_type": "ANALYSIS_END",
-                "message": f"files_total={total_files};selected_files={selected_files};selected_folders={selected_folder_count};chunks={chunk_total};chunk_unit={chunk_unit}",
+                "message": (
+                    f"files_total={total_files};selected_files={selected_files};selected_folders={selected_folder_count};"
+                    f"chunks={chunk_total};chunk_unit={chunk_unit};scan_errors={scan_errors};"
+                    f"collect_size_bytes={'1' if self.cfg.collect_size_bytes else '0'}"
+                ),
             },
             ["run_id", "timestamp", "event_type", "message"],
         )
@@ -449,6 +622,10 @@ class AnalyzeWorkflow:
         self._log(
             f"Analise concluida. arquivos={total_files} selecionados={selected_files} "
             f"pastas_selecionadas={selected_folder_count} chunks={chunk_total} ({chunk_unit})."
+        )
+        self._progress(
+            f"progresso analise: concluido | arquivos={total_files} selecionados={selected_files} "
+            f"chunks={chunk_total}"
         )
         return {
             "run_id": run,
@@ -471,6 +648,7 @@ class SendWorkflow:
         self.cancel_event = cancel_event
         self.progress_callback = progress_callback
         self.current_proc: subprocess.Popen | None = None
+        apply_internal_toolkit_paths(self.cfg, Path(__file__).resolve().parent, self._log)
         self.driver = get_driver(cfg.toolkit)
 
     def _log(self, msg: str) -> None:
@@ -895,6 +1073,7 @@ class ValidationWorkflow:
         self.cfg = cfg
         self.logger = logger
         self.cancel_event = cancel_event
+        apply_internal_toolkit_paths(self.cfg, Path(__file__).resolve().parent, self._log)
         self.driver = get_driver(cfg.toolkit)
 
     def _log(self, msg: str) -> None:
@@ -907,6 +1086,245 @@ class ValidationWorkflow:
                 return p
             return (script_dir / p).resolve()
         return (script_dir / "runs").resolve()
+
+    def _query_instance_dataset(self, iuid: str) -> dict:
+        url = f"http://{self.cfg.pacs_rest_host}/dcm4chee-arc/aets/{self.cfg.aet_destino}/rs/instances?SOPInstanceUID={iuid}"
+        api_found = 0
+        http_status = ""
+        detail = ""
+        dataset: dict = {}
+        try:
+            req = urlrequest.Request(url, method="GET")
+            with urlrequest.urlopen(req, timeout=20) as resp:
+                http_status = str(resp.status)
+                body = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(body) if body.strip() else []
+                if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                    api_found = 1
+                    dataset = data[0]
+        except urlerror.HTTPError as ex:
+            http_status = str(ex.code)
+            detail = str(ex)
+        except Exception as ex:
+            http_status = "ERR"
+            detail = str(ex)
+        return {
+            "api_found": api_found,
+            "http_status": http_status,
+            "detail": detail,
+            "dataset": dataset,
+        }
+
+    def _dicom_text(self, dataset: dict, tag: str) -> str:
+        elem = dataset.get(tag, {})
+        if not isinstance(elem, dict):
+            return ""
+        values = elem.get("Value", [])
+        if not isinstance(values, list) or not values:
+            return ""
+        first = values[0]
+        if isinstance(first, dict):
+            if "Alphabetic" in first:
+                return str(first.get("Alphabetic", "")).strip()
+            for v in first.values():
+                if v is not None:
+                    return str(v).strip()
+            return ""
+        return str(first).strip()
+
+    def _report_fields_from_dataset(self, dataset: dict) -> dict:
+        return {
+            "nome_paciente": self._dicom_text(dataset, "00100010"),
+            "prontuario": self._dicom_text(dataset, "00100020"),
+            "accession_number": self._dicom_text(dataset, "00080050"),
+            "sexo": self._dicom_text(dataset, "00100040"),
+            "data_exame": self._dicom_text(dataset, "00080020"),
+            "descricao_exame": self._dicom_text(dataset, "00081030"),
+            "study_uid": self._dicom_text(dataset, "0020000D"),
+        }
+
+    def export_complete_report(self, run_id: str, report_mode: str = "A") -> dict:
+        run = run_id.strip()
+        if not run:
+            raise RuntimeError("run_id e obrigatorio para exportar relatorio.")
+        mode = (report_mode or "A").strip().upper()
+        if mode not in ["A", "C"]:
+            raise RuntimeError(f"Modo de relatorio invalido: {report_mode}")
+
+        script_dir = Path(__file__).resolve().parent
+        run_dir = self._resolve_runs_base(script_dir) / run
+        if not run_dir.exists():
+            raise RuntimeError(f"Run nao encontrado: {run_dir}")
+
+        send_results = run_dir / "send_results_by_file.csv"
+        file_iuid_map = run_dir / "file_iuid_map.csv"
+        if not send_results.exists():
+            raise RuntimeError(f"Arquivo nao encontrado: {send_results}")
+
+        send_rows = read_csv_rows(send_results)
+        map_rows = read_csv_rows(file_iuid_map)
+        map_by_file: dict[str, str] = {}
+        for r in map_rows:
+            fp = r.get("file_path", "").strip()
+            iu = r.get("sop_instance_uid", "").strip()
+            if fp and iu:
+                map_by_file[fp] = iu
+
+        sent_ok_rows = [r for r in send_rows if r.get("send_status", "") == "SENT_OK"]
+        if not sent_ok_rows:
+            raise RuntimeError("Nenhum arquivo SENT_OK encontrado para exportacao.")
+
+        report_records: list[dict] = []
+        for row in sent_ok_rows:
+            fp = row.get("file_path", "").strip()
+            if not fp:
+                continue
+            iuid = map_by_file.get(fp, "").strip()
+            if not iuid:
+                iuid, ts_uid, ts_name, err = self.driver.extract_metadata(self.cfg, Path(fp))
+                if iuid:
+                    map_by_file[fp] = iuid
+                    write_csv_row(
+                        file_iuid_map,
+                        {
+                            "run_id": run,
+                            "file_path": fp,
+                            "sop_instance_uid": iuid,
+                            "source_ts_uid": ts_uid,
+                            "source_ts_name": ts_name,
+                            "extract_status": "REPORT_EXPORT_OK",
+                            "mapped_at": now_br(),
+                        },
+                        ["run_id", "file_path", "sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status", "mapped_at"],
+                    )
+                else:
+                    self._log(f"[WARN] IUID ausente para arquivo no relatorio: {fp} | erro={err or 'desconhecido'}")
+            report_records.append({"file_path": fp, "sop_instance_uid": iuid})
+
+        unique_iuids = sorted({r["sop_instance_uid"] for r in report_records if r["sop_instance_uid"]})
+        self._log(f"[REPORT_EXPORT] Modo {mode} | IUIDs unicos para consulta: {len(unique_iuids)}")
+
+        iuid_data: dict[str, dict] = {}
+        done = 0
+        for iuid in unique_iuids:
+            if self.cancel_event.is_set():
+                raise RuntimeError("Exportacao de relatorio cancelada.")
+            query = self._query_instance_dataset(iuid)
+            fields = self._report_fields_from_dataset(query.get("dataset", {}))
+            status = "OK" if query.get("api_found", 0) == 1 else "ERRO"
+            iuid_data[iuid] = {
+                **fields,
+                "status": status,
+                "http_status": str(query.get("http_status", "")),
+                "detail": str(query.get("detail", "")),
+            }
+            done += 1
+            if done % 100 == 0:
+                self._log(f"[REPORT_EXPORT_PROGRESS] {done}/{len(unique_iuids)} IUIDs consultados")
+
+        rows_a: list[dict] = []
+        for rec in report_records:
+            fp = rec.get("file_path", "")
+            iuid = rec.get("sop_instance_uid", "")
+            base = iuid_data.get(
+                iuid,
+                {
+                    "nome_paciente": "",
+                    "prontuario": "",
+                    "accession_number": "",
+                    "sexo": "",
+                    "data_exame": "",
+                    "descricao_exame": "",
+                    "study_uid": "",
+                    "status": "ERRO",
+                    "http_status": "",
+                    "detail": "IUID ausente",
+                },
+            )
+            rows_a.append(
+                {
+                    "run_id": run,
+                    "file_path": fp,
+                    "sop_instance_uid": iuid,
+                    "nome_paciente": base.get("nome_paciente", ""),
+                    "prontuario": base.get("prontuario", ""),
+                    "accession_number": base.get("accession_number", ""),
+                    "sexo": base.get("sexo", ""),
+                    "data_exame": base.get("data_exame", ""),
+                    "descricao_exame": base.get("descricao_exame", ""),
+                    "study_uid": base.get("study_uid", ""),
+                    "status": base.get("status", "ERRO"),
+                }
+            )
+
+        if mode == "A":
+            report_file = run_dir / "validation_full_report_A.csv"
+            fieldnames = [
+                "run_id",
+                "file_path",
+                "sop_instance_uid",
+                "nome_paciente",
+                "prontuario",
+                "accession_number",
+                "sexo",
+                "data_exame",
+                "descricao_exame",
+                "study_uid",
+                "status",
+            ]
+            write_csv_table(report_file, rows_a, fieldnames)
+            status_ok = sum(1 for r in rows_a if r.get("status") == "OK")
+            status_err = len(rows_a) - status_ok
+            self._log(f"[REPORT_EXPORT] Relatorio A exportado: {report_file} | linhas={len(rows_a)} ok={status_ok} erro={status_err}")
+            return {"run_id": run, "mode": mode, "report_file": str(report_file), "rows": len(rows_a), "ok": status_ok, "erro": status_err}
+
+        grouped: dict[str, dict] = {}
+        for row in rows_a:
+            study_uid = row.get("study_uid", "").strip()
+            key = study_uid if study_uid else f"__ERRO__{row.get('sop_instance_uid', '').strip() or row.get('file_path', '').strip()}"
+            agg = grouped.setdefault(
+                key,
+                {
+                    "run_id": run,
+                    "study_uid": study_uid,
+                    "nome_paciente": "",
+                    "prontuario": "",
+                    "accession_number": "",
+                    "sexo": "",
+                    "data_exame": "",
+                    "descricao_exame": "",
+                    "status": "OK",
+                    "total_arquivos": 0,
+                },
+            )
+            agg["total_arquivos"] = int(agg.get("total_arquivos", 0)) + 1
+            for f in ["nome_paciente", "prontuario", "accession_number", "sexo", "data_exame", "descricao_exame"]:
+                if not agg.get(f):
+                    agg[f] = row.get(f, "")
+            if not agg.get("study_uid"):
+                agg["study_uid"] = study_uid
+            if row.get("status", "ERRO") == "ERRO":
+                agg["status"] = "ERRO"
+
+        rows_c = sorted(grouped.values(), key=lambda x: str(x.get("study_uid", "")))
+        report_file = run_dir / "validation_full_report_C.csv"
+        fieldnames = [
+            "run_id",
+            "study_uid",
+            "nome_paciente",
+            "prontuario",
+            "accession_number",
+            "sexo",
+            "data_exame",
+            "descricao_exame",
+            "status",
+            "total_arquivos",
+        ]
+        write_csv_table(report_file, rows_c, fieldnames)
+        status_ok = sum(1 for r in rows_c if r.get("status") == "OK")
+        status_err = len(rows_c) - status_ok
+        self._log(f"[REPORT_EXPORT] Relatorio C exportado: {report_file} | linhas={len(rows_c)} ok={status_ok} erro={status_err}")
+        return {"run_id": run, "mode": mode, "report_file": str(report_file), "rows": len(rows_c), "ok": status_ok, "erro": status_err}
 
     def run_validation(self, run_id: str) -> dict:
         run = run_id.strip()
@@ -1118,8 +1536,6 @@ class ConfigDialog(tk.Toplevel):
         self.on_test_echo = on_test_echo
 
         self.var_toolkit = tk.StringVar(value=config.toolkit)
-        self.var_dcm4che = tk.StringVar(value=config.dcm4che_bin_path)
-        self.var_dcmtk = tk.StringVar(value=config.dcmtk_bin_path)
         self.var_aet_src = tk.StringVar(value=config.aet_origem)
         self.var_aet_dst = tk.StringVar(value=config.aet_destino)
         self.var_host = tk.StringVar(value=config.pacs_host)
@@ -1129,26 +1545,30 @@ class ConfigDialog(tk.Toplevel):
         self.var_batch = tk.StringVar(value=str(config.batch_size_default))
         self.var_ext = tk.StringVar(value=config.allowed_extensions_csv)
         self.var_no_ext = tk.BooleanVar(value=bool(config.include_no_extension))
+        self.var_collect_size = tk.BooleanVar(value=bool(config.collect_size_bytes))
         self.var_ts = tk.StringVar(value=config.ts_mode)
 
         frm = ttk.Frame(self, padding=12)
         frm.grid(sticky="nsew")
         self._row_entry(frm, 0, "Toolkit", self.var_toolkit, combo_values=["dcm4che", "dcmtk"])
-        self._row_entry(frm, 1, "dcm4che bin path", self.var_dcm4che, browse=True)
-        self._row_entry(frm, 2, "dcmtk bin path", self.var_dcmtk, browse=True)
-        self._row_entry(frm, 3, "AET origem", self.var_aet_src)
-        self._row_entry(frm, 4, "AET destino", self.var_aet_dst)
-        self._row_entry(frm, 5, "PACS host", self.var_host)
-        self._row_entry(frm, 6, "PACS port", self.var_port)
-        self._row_entry(frm, 7, "PACS REST host:porta", self.var_rest)
-        self._row_entry(frm, 8, "Runs base dir", self.var_runs, browse=True)
-        self._row_entry(frm, 9, "Batch default", self.var_batch)
-        self._row_entry(frm, 10, "Extensoes permitidas (csv)", self.var_ext)
-        ttk.Checkbutton(frm, text="Incluir arquivos sem extensao", variable=self.var_no_ext).grid(row=11, column=0, columnspan=2, sticky="w")
-        self._row_entry(frm, 12, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
+        self._row_entry(frm, 1, "AET origem", self.var_aet_src)
+        self._row_entry(frm, 2, "AET destino", self.var_aet_dst)
+        self._row_entry(frm, 3, "PACS host", self.var_host)
+        self._row_entry(frm, 4, "PACS port", self.var_port)
+        self._row_entry(frm, 5, "PACS REST host:porta", self.var_rest)
+        self._row_entry(frm, 6, "Runs base dir", self.var_runs, browse=True)
+        self._row_entry(frm, 7, "Batch default", self.var_batch)
+        self._row_entry(frm, 8, "Extensoes permitidas (csv)", self.var_ext)
+        ttk.Checkbutton(frm, text="Incluir arquivos sem extensao", variable=self.var_no_ext).grid(row=9, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(
+            frm,
+            text="Calcular size_bytes na analise (mais lento)",
+            variable=self.var_collect_size,
+        ).grid(row=10, column=0, columnspan=2, sticky="w")
+        self._row_entry(frm, 11, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
 
         btns = ttk.Frame(frm)
-        btns.grid(row=13, column=0, columnspan=3, pady=(12, 0), sticky="e")
+        btns.grid(row=12, column=0, columnspan=3, pady=(12, 0), sticky="e")
         ttk.Button(btns, text="Testar Echo", command=self._test_echo).pack(side="left", padx=4)
         ttk.Button(btns, text="Salvar", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Fechar", command=self.destroy).pack(side="left", padx=4)
@@ -1171,8 +1591,6 @@ class ConfigDialog(tk.Toplevel):
     def _build_config(self) -> AppConfig:
         return AppConfig(
             toolkit=self.var_toolkit.get().strip(),
-            dcm4che_bin_path=self.var_dcm4che.get().strip(),
-            dcmtk_bin_path=self.var_dcmtk.get().strip(),
             aet_origem=self.var_aet_src.get().strip(),
             aet_destino=self.var_aet_dst.get().strip(),
             pacs_host=self.var_host.get().strip(),
@@ -1182,6 +1600,7 @@ class ConfigDialog(tk.Toplevel):
             batch_size_default=int(self.var_batch.get().strip()),
             allowed_extensions_csv=self.var_ext.get().strip(),
             include_no_extension=bool(self.var_no_ext.get()),
+            collect_size_bytes=bool(self.var_collect_size.get()),
             ts_mode=self.var_ts.get().strip(),
         )
 
@@ -1210,10 +1629,10 @@ class ConfigDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("DICOM Multi Toolkit")
-        self.geometry("1180x760")
-
         self.base_dir = Path(__file__).resolve().parent
+        self.app_version = read_app_version(self.base_dir)
+        self.title(f"{APP_DISPLAY_NAME} - {self.app_version}")
+        self.geometry("1180x760")
         self.config_file = self.base_dir / "app_config.json"
         self.config_obj = self._load_config()
         self.queue: queue.Queue = queue.Queue()
@@ -1222,14 +1641,15 @@ class App(tk.Tk):
 
         self.progress_items_var = tk.StringVar(value="enviando item 0 de 0")
         self.progress_chunks_var = tk.StringVar(value="batch chunk 0 de 0")
+        self.analysis_progress_var = tk.StringVar(value="progresso analise: aguardando")
 
         self._build_menu()
         self._build_ui()
         self._poll_queue()
 
     def _load_config(self) -> AppConfig:
-        dcm4che_bin = find_toolkit_bin(self.base_dir, "dcm4che", "storescu.bat") or find_first_bin(self.base_dir, "storescu.bat")
-        dcmtk_bin = find_toolkit_bin(self.base_dir, "dcmtk", "storescu.exe") or find_first_bin(self.base_dir, "storescu.exe")
+        dcm4che_bin = find_toolkit_bin(self.base_dir, "dcm4che", "storescu.bat")
+        dcmtk_bin = find_toolkit_bin(self.base_dir, "dcmtk", "storescu.exe")
         cfg = AppConfig(
             dcm4che_bin_path=dcm4che_bin,
             dcmtk_bin_path=dcmtk_bin,
@@ -1240,6 +1660,7 @@ class App(tk.Tk):
                 cfg = AppConfig(**{**asdict(cfg), **raw})
             except Exception:
                 pass
+        apply_internal_toolkit_paths(cfg, self.base_dir)
         return cfg
 
     def _save_config(self, cfg: AppConfig):
@@ -1256,6 +1677,7 @@ class App(tk.Tk):
         m.add_command(label="Configuracoes", command=self._open_config_dialog)
         m.add_command(label="Atualizar runs", command=self._refresh_run_list)
         menu.add_cascade(label="Configuracao", menu=m)
+        menu.add_command(label="Sobre", command=self._show_about)
 
     def _build_ui(self):
         nb = ttk.Notebook(self)
@@ -1295,6 +1717,7 @@ class App(tk.Tk):
         dash.pack(fill="x", padx=10, pady=8)
         self.lbl_dash = tk.StringVar(value="Sem analise executada.")
         ttk.Label(dash, textvariable=self.lbl_dash, justify="left").pack(anchor="w")
+        ttk.Label(dash, textvariable=self.analysis_progress_var, justify="left").pack(anchor="w", pady=(6, 0))
 
         log_frame = ttk.Frame(self.tab_an, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
@@ -1336,12 +1759,22 @@ class App(tk.Tk):
         top = ttk.Frame(self.tab_val, padding=10)
         top.pack(fill="x")
         self.var_val_run = tk.StringVar()
+        self.var_report_mode = tk.StringVar(value="A - por arquivo")
         ttk.Label(top, text="Run ID").grid(row=0, column=0, sticky="w")
         self.cmb_val_runs = ttk.Combobox(top, textvariable=self.var_val_run, width=40)
         self.cmb_val_runs.grid(row=0, column=1, sticky="w", padx=6)
         ttk.Button(top, text="Atualizar", command=self._refresh_run_list).grid(row=0, column=2, padx=4)
         ttk.Button(top, text="Validar Run", command=self._start_validation).grid(row=0, column=3, padx=4)
         ttk.Button(top, text="Cancelar", command=self._cancel_current_job).grid(row=0, column=4, padx=4)
+        ttk.Label(top, text="Modo relatorio").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            top,
+            textvariable=self.var_report_mode,
+            values=["A - por arquivo", "C - por StudyUID"],
+            width=24,
+            state="readonly",
+        ).grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
+        ttk.Button(top, text="Exportar relatorio completo", command=self._start_export_report).grid(row=1, column=3, padx=4, pady=(8, 0))
         log_frame = ttk.Frame(self.tab_val, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
         self.txt_val = tk.Text(log_frame, wrap="none")
@@ -1392,8 +1825,15 @@ class App(tk.Tk):
     def _open_config_dialog(self):
         ConfigDialog(self, self.config_obj, self._save_config, self._test_echo)
 
+    def _show_about(self):
+        messagebox.showinfo(
+            "Sobre",
+            f"{APP_DISPLAY_NAME}\nVersao: {self.app_version}\n\nFluxo DICOM com dcm4che e DCMTK.",
+        )
+
     def _test_echo(self, cfg: AppConfig) -> tuple[bool, str]:
         try:
+            apply_internal_toolkit_paths(cfg, self.base_dir)
             cmd = get_driver(cfg.toolkit).echo_cmd(cfg)
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False, **hidden_process_kwargs())
             out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
@@ -1425,12 +1865,20 @@ class App(tk.Tk):
         run_id = self.var_run_id.get().strip()
         self.cancel_event.clear()
         self._log_an("Iniciando analise...")
+        self.analysis_progress_var.set("progresso analise: iniciando...")
 
         def task():
             try:
-                wf = AnalyzeWorkflow(self.config_obj, lambda m: self.queue.put(("an_log", m)))
+                wf = AnalyzeWorkflow(
+                    self.config_obj,
+                    lambda m: self.queue.put(("an_log", m)),
+                    self.cancel_event,
+                    lambda p: self.queue.put(("an_progress", p)),
+                )
                 result = wf.run_analysis(exam_root=exam_root, batch_size=batch, run_id=run_id)
                 self.queue.put(("an_done", result))
+            except WorkflowCancelled as ex:
+                self.queue.put(("an_cancelled", str(ex)))
             except Exception as ex:
                 self.queue.put(("an_error", str(ex)))
 
@@ -1492,6 +1940,30 @@ class App(tk.Tk):
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
 
+    def _start_export_report(self):
+        if self._worker_busy():
+            messagebox.showwarning("Em execucao", "Ja existe um processo em execucao.")
+            return
+        run_id = self.var_val_run.get().strip()
+        if not run_id:
+            messagebox.showerror("Erro", "Informe run_id.")
+            return
+        mode_label = self.var_report_mode.get().strip()
+        mode = "A" if mode_label.upper().startswith("A") else "C"
+        self.cancel_event.clear()
+        self._log_val(f"Iniciando exportacao do relatorio completo (modo {mode})...")
+
+        def task():
+            try:
+                wf = ValidationWorkflow(self.config_obj, lambda m: self.queue.put(("val_log", m)), self.cancel_event)
+                result = wf.export_complete_report(run_id=run_id, report_mode=mode)
+                self.queue.put(("report_done", result))
+            except Exception as ex:
+                self.queue.put(("report_error", str(ex)))
+
+        self.worker_thread = threading.Thread(target=task, daemon=True)
+        self.worker_thread.start()
+
     def _cancel_current_job(self):
         if not self._worker_busy():
             return
@@ -1526,12 +1998,15 @@ class App(tk.Tk):
                 event, payload = self.queue.get_nowait()
                 if event == "an_log":
                     self._log_an(payload)
+                elif event == "an_progress":
+                    self.analysis_progress_var.set(payload)
                 elif event == "send_log":
                     self._log_send(payload)
                 elif event == "val_log":
                     self._log_val(payload)
                 elif event == "an_done":
                     self._log_an(f"Analise finalizada. Run ID: {payload.get('run_id')}")
+                    self.analysis_progress_var.set("progresso analise: finalizada")
                     self.var_send_run.set(payload.get("run_id", ""))
                     self.var_val_run.set(payload.get("run_id", ""))
                     self.var_run_id.set(payload.get("run_id", ""))
@@ -1561,15 +2036,30 @@ class App(tk.Tk):
                 elif event == "val_done":
                     self._log_val(f"VALIDACAO finalizada. Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
                     self._refresh_run_list()
+                elif event == "report_done":
+                    self._log_val(
+                        "RELATORIO exportado. "
+                        f"Run ID: {payload.get('run_id')} | Modo: {payload.get('mode')} | "
+                        f"Linhas: {payload.get('rows')} | OK: {payload.get('ok')} | ERRO: {payload.get('erro')}\n"
+                        f"Arquivo: {payload.get('report_file')}"
+                    )
+                    self._refresh_run_list()
                 elif event == "an_error":
                     self._log_an(f"[ERRO] {payload}")
+                    self.analysis_progress_var.set("progresso analise: erro")
                     messagebox.showerror("Erro na Analise", payload)
+                elif event == "an_cancelled":
+                    self._log_an(payload)
+                    self.analysis_progress_var.set("progresso analise: cancelado")
                 elif event == "send_error":
                     self._log_send(f"[ERRO] {payload}")
                     messagebox.showerror("Erro no SEND", payload)
                 elif event == "val_error":
                     self._log_val(f"[ERRO] {payload}")
                     messagebox.showerror("Erro na VALIDACAO", payload)
+                elif event == "report_error":
+                    self._log_val(f"[ERRO] {payload}")
+                    messagebox.showerror("Erro na exportacao do relatorio", payload)
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)
