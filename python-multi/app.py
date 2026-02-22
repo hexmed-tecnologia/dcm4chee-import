@@ -61,8 +61,17 @@ def now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def now_br() -> str:
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def now_dual_timestamp() -> tuple[str, str]:
+    dt = datetime.now()
+    return dt.strftime("%d/%m/%Y %H:%M:%S"), dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def now_run_id() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%d%m%Y_%H%M%S")
 
 
 def parse_extensions(value: str) -> set[str]:
@@ -80,11 +89,28 @@ def parse_extensions(value: str) -> set[str]:
 def write_csv_row(path: Path, row: dict, fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
+    active_fields = list(fieldnames)
+    if write_header:
+        if "timestamp_br" not in active_fields:
+            active_fields.append("timestamp_br")
+        if "timestamp_iso" not in active_fields:
+            active_fields.append("timestamp_iso")
+    else:
+        # Keep compatibility when appending to older CSV schemas.
+        with path.open("r", newline="", encoding="utf-8", errors="replace") as f:
+            first = f.readline().strip()
+        if first:
+            active_fields = next(csv.reader([first], delimiter=CSV_SEP))
+    row_data = dict(row)
+    if "timestamp_br" in active_fields and "timestamp_br" not in row_data:
+        ts_br, ts_iso = now_dual_timestamp()
+        row_data["timestamp_br"] = ts_br
+        row_data["timestamp_iso"] = ts_iso
     with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=CSV_SEP)
+        writer = csv.DictWriter(f, fieldnames=active_fields, delimiter=CSV_SEP)
         if write_header:
             writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in fieldnames})
+        writer.writerow({k: row_data.get(k, "") for k in active_fields})
 
 
 def read_csv_rows(path: Path) -> list[dict]:
@@ -296,6 +322,7 @@ class AnalyzeWorkflow:
         selected_files = 0
         selected_bytes = 0
         excluded_files = 0
+        selected_folder_keys: set[str] = set()
 
         file_fields = [
             "run_id",
@@ -326,6 +353,7 @@ class AnalyzeWorkflow:
                 if include:
                     selected_files += 1
                     selected_bytes += size
+                    selected_folder_keys.add(str(folder))
                 else:
                     excluded_files += 1
 
@@ -348,7 +376,7 @@ class AnalyzeWorkflow:
                         "selected_for_send": 1 if include else 0,
                         "selection_reason": reason,
                         "dicom_status": "UNKNOWN",
-                        "discovered_at": now_iso(),
+                        "discovered_at": now_br(),
                     },
                     file_fields,
                 )
@@ -362,23 +390,28 @@ class AnalyzeWorkflow:
                     "folder_path": folder,
                     "file_count": agg["count"],
                     "size_bytes": agg["bytes"],
-                    "discovered_at": now_iso(),
+                    "discovered_at": now_br(),
                 },
                 folder_fields,
             )
 
-        chunk_total = math.ceil(selected_files / batch_size) if selected_files else 0
+        chunk_unit = "pastas" if self.cfg.toolkit == "dcm4che" else "arquivos"
+        selected_folder_count = len(selected_folder_keys)
+        chunk_base_count = selected_folder_count if self.cfg.toolkit == "dcm4che" else selected_files
+        chunk_total = math.ceil(chunk_base_count / batch_size) if chunk_base_count else 0
         summary_fields = [
             "run_id",
             "root_path",
             "toolkit",
             "batch_size",
             "folders_total",
+            "folders_selected_for_send",
             "files_total",
             "files_selected_for_send",
             "files_excluded",
             "size_total_bytes",
             "size_selected_bytes",
+            "chunk_unit",
             "chunks_total",
             "generated_at",
         ]
@@ -390,13 +423,15 @@ class AnalyzeWorkflow:
                 "toolkit": self.cfg.toolkit,
                 "batch_size": batch_size,
                 "folders_total": len(folder_agg),
+                "folders_selected_for_send": selected_folder_count,
                 "files_total": total_files,
                 "files_selected_for_send": selected_files,
                 "files_excluded": excluded_files,
                 "size_total_bytes": total_bytes,
                 "size_selected_bytes": selected_bytes,
+                "chunk_unit": chunk_unit,
                 "chunks_total": chunk_total,
-                "generated_at": now_iso(),
+                "generated_at": now_br(),
             },
             summary_fields,
         )
@@ -404,15 +439,29 @@ class AnalyzeWorkflow:
             events,
             {
                 "run_id": run,
-                "timestamp": now_iso(),
+                "timestamp": now_br(),
                 "event_type": "ANALYSIS_END",
-                "message": f"files_total={total_files};selected={selected_files};chunks={chunk_total}",
+                "message": f"files_total={total_files};selected_files={selected_files};selected_folders={selected_folder_count};chunks={chunk_total};chunk_unit={chunk_unit}",
             },
             ["run_id", "timestamp", "event_type", "message"],
         )
 
-        self._log(f"Analise concluida. arquivos={total_files} selecionados={selected_files} chunks={chunk_total}")
-        return {"run_id": run, "run_dir": str(run_dir), "chunks_total": chunk_total, "files_total": total_files, "files_selected": selected_files}
+        self._log(
+            f"Analise concluida. arquivos={total_files} selecionados={selected_files} "
+            f"pastas_selecionadas={selected_folder_count} chunks={chunk_total} ({chunk_unit})."
+        )
+        return {
+            "run_id": run,
+            "run_dir": str(run_dir),
+            "chunks_total": chunk_total,
+            "chunk_unit": chunk_unit,
+            "files_total": total_files,
+            "files_selected": selected_files,
+            "folders_total": len(folder_agg),
+            "folders_selected": selected_folder_count,
+            "size_total_bytes": total_bytes,
+            "size_selected_bytes": selected_bytes,
+        }
 
 
 class SendWorkflow:
@@ -529,6 +578,33 @@ class SendWorkflow:
             chunks = [selected[i : i + batch_size] for i in range(done_units, units_total, batch_size)]
             total_chunks = math.ceil(units_total / batch_size) if units_total else 0
 
+        if units_total > 0 and done_units >= units_total:
+            prev_status = ""
+            if send_summary.exists():
+                prev_rows = read_csv_rows(send_summary)
+                if prev_rows:
+                    prev_status = str(prev_rows[-1].get("status", "")).strip()
+            if prev_status == "PASS":
+                msg = "Este run ja foi enviado com sucesso anteriormente. Nenhum item pendente para envio."
+                status = "ALREADY_SENT_PASS"
+            else:
+                msg = "Este run nao possui itens pendentes para envio."
+                status = "ALREADY_SENT"
+            self._log(msg)
+            write_csv_row(
+                send_events,
+                {
+                    "timestamp": now_br(),
+                    "run_id": run,
+                    "event_type": "RUN_SEND_SKIP_ALREADY_COMPLETED",
+                    "chunk_no": "",
+                    "message": msg,
+                    "extra": f"prev_status={prev_status or 'N/A'}",
+                },
+                ["timestamp", "run_id", "event_type", "chunk_no", "message", "extra"],
+            )
+            return {"run_id": run, "status": status, "run_dir": str(run_dir)}
+
         event_fields = ["timestamp", "run_id", "event_type", "chunk_no", "message", "extra"]
         result_fields = [
             "run_id",
@@ -548,7 +624,7 @@ class SendWorkflow:
 
         write_csv_row(
             send_events,
-            {"timestamp": now_iso(), "run_id": run, "event_type": "RUN_SEND_START", "chunk_no": "", "message": "Envio iniciado", "extra": f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit}"},
+            {"timestamp": now_br(), "run_id": run, "event_type": "RUN_SEND_START", "chunk_no": "", "message": "Envio iniciado", "extra": f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit}"},
             event_fields,
         )
 
@@ -577,7 +653,7 @@ class SendWorkflow:
             self._log(f"Chunk {chunk_index}/{total_chunks} - enviando itens {first_item} ate {last_item} de {total_items}")
             write_csv_row(
                 send_events,
-                {"timestamp": now_iso(), "run_id": run, "event_type": "CHUNK_START", "chunk_no": chunk_index, "message": "Chunk iniciado", "extra": f"items={len(batch_files)};units={len(batch_inputs)}"},
+                {"timestamp": now_br(), "run_id": run, "event_type": "CHUNK_START", "chunk_no": chunk_index, "message": "Chunk iniciado", "extra": f"items={len(batch_files)};units={len(batch_inputs)}"},
                 event_fields,
             )
 
@@ -664,7 +740,7 @@ class SendWorkflow:
                             "sop_instance_uid": iuid,
                             "source_ts_uid": ts_uid,
                             "source_ts_name": ts_name,
-                            "processed_at": now_iso(),
+                            "processed_at": now_br(),
                         },
                         result_fields,
                     )
@@ -677,7 +753,7 @@ class SendWorkflow:
                                 "chunk_no": chunk_index,
                                 "error_type": status,
                                 "message": detail,
-                                "logged_at": now_iso(),
+                                "logged_at": now_br(),
                             },
                             error_fields,
                         )
@@ -691,7 +767,7 @@ class SendWorkflow:
                                 "source_ts_uid": ts_uid,
                                 "source_ts_name": ts_name,
                                 "extract_status": "OK_FROM_STORESCU",
-                                "mapped_at": now_iso(),
+                                "mapped_at": now_br(),
                             },
                             map_fields,
                         )
@@ -734,7 +810,7 @@ class SendWorkflow:
                             "sop_instance_uid": iuid,
                             "source_ts_uid": ts_uid,
                             "source_ts_name": ts_name,
-                            "processed_at": now_iso(),
+                            "processed_at": now_br(),
                         },
                         result_fields,
                     )
@@ -747,7 +823,7 @@ class SendWorkflow:
                                 "chunk_no": chunk_index,
                                 "error_type": status,
                                 "message": detail,
-                                "logged_at": now_iso(),
+                                "logged_at": now_br(),
                             },
                             error_fields,
                         )
@@ -761,7 +837,7 @@ class SendWorkflow:
                                 "source_ts_uid": ts_uid,
                                 "source_ts_name": ts_name,
                                 "extract_status": "OK",
-                                "mapped_at": now_iso(),
+                                "mapped_at": now_br(),
                             },
                             map_fields,
                         )
@@ -769,7 +845,7 @@ class SendWorkflow:
             unit_cursor += len(batch_inputs)
             checkpoint.write_text(
                 json.dumps(
-                    {"run_id": run, "done_units": unit_cursor, "done_files": item_cursor, "updated_at": now_iso()},
+                    {"run_id": run, "done_units": unit_cursor, "done_files": item_cursor, "updated_at": now_br()},
                     ensure_ascii=True,
                     indent=2,
                 ),
@@ -778,7 +854,7 @@ class SendWorkflow:
             write_csv_row(
                 send_events,
                 {
-                    "timestamp": now_iso(),
+                    "timestamp": now_br(),
                     "run_id": run,
                     "event_type": "CHUNK_END",
                     "chunk_no": chunk_index,
@@ -801,13 +877,13 @@ class SendWorkflow:
                 "warnings": warned,
                 "failed": failed,
                 "status": final_status,
-                "finished_at": now_iso(),
+                "finished_at": now_br(),
             },
             ["run_id", "toolkit", "ts_mode_effective", "total_items", "items_processed", "sent_ok", "warnings", "failed", "status", "finished_at"],
         )
         write_csv_row(
             send_events,
-            {"timestamp": now_iso(), "run_id": run, "event_type": "RUN_SEND_END", "chunk_no": "", "message": "Envio finalizado", "extra": f"status={final_status}"},
+            {"timestamp": now_br(), "run_id": run, "event_type": "RUN_SEND_END", "chunk_no": "", "message": "Envio finalizado", "extra": f"status={final_status}"},
             event_fields,
         )
         self._log(f"Resumo envio: ok={sent_ok} warn={warned} fail={failed} status={final_status}")
@@ -860,6 +936,17 @@ class ValidationWorkflow:
             if fp and iu:
                 map_by_file[fp] = iu
 
+        total_send_rows = len(send_rows)
+        send_ok_files = sum(1 for r in send_rows if r.get("send_status", "") == "SENT_OK")
+        send_warn_files = sum(1 for r in send_rows if r.get("send_status", "") in ["NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"])
+        send_fail_files = sum(1 for r in send_rows if r.get("send_status", "") == "SEND_FAIL")
+        self._log(f"Validacao do run: {run}")
+        self._log(
+            f"Resumo send para validacao: total={total_send_rows} sent_ok={send_ok_files} "
+            f"warn={send_warn_files} fail={send_fail_files}"
+        )
+        self._log(f"Mapeamentos IUID atuais: {len(map_by_file)}")
+
         map_fields = ["run_id", "file_path", "sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status", "mapped_at"]
         cons_fields = ["timestamp", "run_id", "event_type", "file_path", "message"]
 
@@ -882,19 +969,19 @@ class ValidationWorkflow:
                         "source_ts_uid": ts_uid,
                         "source_ts_name": ts_name,
                         "extract_status": "CONSISTENCY_OK",
-                        "mapped_at": now_iso(),
+                        "mapped_at": now_br(),
                     },
                     map_fields,
                 )
                 write_csv_row(
                     consistency,
-                    {"timestamp": now_iso(), "run_id": run, "event_type": "CONSISTENCY_FILLED", "file_path": fp, "message": "IUID preenchido antes da validacao"},
+                    {"timestamp": now_br(), "run_id": run, "event_type": "CONSISTENCY_FILLED", "file_path": fp, "message": "IUID preenchido antes da validacao"},
                     cons_fields,
                 )
             else:
                 write_csv_row(
                     consistency,
-                    {"timestamp": now_iso(), "run_id": run, "event_type": "CONSISTENCY_MISSING", "file_path": fp, "message": err or "nao foi possivel extrair IUID"},
+                    {"timestamp": now_br(), "run_id": run, "event_type": "CONSISTENCY_MISSING", "file_path": fp, "message": err or "nao foi possivel extrair IUID"},
                     cons_fields,
                 )
 
@@ -907,6 +994,8 @@ class ValidationWorkflow:
             if not iuid:
                 continue
             iuid_to_files.setdefault(iuid, []).append(fp)
+
+        self._log(f"IUIDs unicos para consulta API: {len(iuid_to_files)}")
 
         iuid_fields = ["run_id", "sop_instance_uid", "api_found", "http_status", "detail", "checked_at"]
         file_fields = ["run_id", "file_path", "sop_instance_uid", "send_status", "validation_status", "checked_at"]
@@ -951,7 +1040,7 @@ class ValidationWorkflow:
                     "api_found": api_found,
                     "http_status": http_status,
                     "detail": detail,
-                    "checked_at": now_iso(),
+                    "checked_at": now_br(),
                 },
                 iuid_fields,
             )
@@ -965,9 +1054,14 @@ class ValidationWorkflow:
                         "sop_instance_uid": iuid,
                         "send_status": "SENT_OK",
                         "validation_status": status,
-                        "checked_at": now_iso(),
+                        "checked_at": now_br(),
                     },
                     file_fields,
+                )
+            if (ok_count + miss_count + api_err_count) % 100 == 0:
+                self._log(
+                    f"Progresso validacao API: {ok_count + miss_count + api_err_count}/{len(iuid_to_files)} "
+                    f"(ok={ok_count}, nf={miss_count}, api_err={api_err_count})"
                 )
 
         warnings_count = 0
@@ -997,11 +1091,21 @@ class ValidationWorkflow:
                 "send_warning_files": warnings_count,
                 "send_failed_files": fail_count,
                 "final_status": final_status,
-                "generated_at": now_iso(),
+                "generated_at": now_br(),
             },
             ["run_id", "toolkit", "total_iuid_unique", "iuid_ok", "iuid_not_found", "iuid_api_error", "send_warning_files", "send_failed_files", "final_status", "generated_at"],
         )
-        self._log(f"Validacao finalizada: status={final_status} iuid_ok={ok_count} iuid_nf={miss_count} api_err={api_err_count}")
+        self._log("--- Resumo Final Validacao ---")
+        self._log(f"Run ID: {run}")
+        self._log(f"Arquivos do send: {total_send_rows}")
+        self._log(f"Arquivos SENT_OK: {send_ok_files}")
+        self._log(f"Arquivos com warning no send: {send_warn_files}")
+        self._log(f"Arquivos com falha no send: {send_fail_files}")
+        self._log(f"IUIDs unicos consultados: {len(iuid_to_files)}")
+        self._log(f"IUIDs OK: {ok_count}")
+        self._log(f"IUIDs NOT_FOUND: {miss_count}")
+        self._log(f"IUIDs API_ERROR: {api_err_count}")
+        self._log(f"Status final: {final_status}")
         return {"run_id": run, "status": final_status, "run_dir": str(run_dir)}
 
 
@@ -1178,7 +1282,7 @@ class App(tk.Tk):
         ttk.Label(top, text="Pasta exames").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_exam_root, width=90).grid(row=0, column=1, sticky="we", padx=6)
         ttk.Button(top, text="...", width=3, command=self._browse_exam_root).grid(row=0, column=2)
-        ttk.Label(top, text="Batch size (arquivos)").grid(row=1, column=0, sticky="w")
+        ttk.Label(top, text="Batch size (dcm4che=pastas | dcmtk=arquivos)").grid(row=1, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_batch_size, width=12).grid(row=1, column=1, sticky="w", padx=6)
         ttk.Label(top, text="Run ID (opcional)").grid(row=2, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_run_id, width=28).grid(row=2, column=1, sticky="w", padx=6)
@@ -1435,16 +1539,24 @@ class App(tk.Tk):
                     self.lbl_dash.set(
                         "Resumo:\n"
                         f"- run_id: {payload.get('run_id')}\n"
+                        f"- pastas totais: {payload.get('folders_total')}\n"
+                        f"- pastas selecionadas: {payload.get('folders_selected')}\n"
                         f"- arquivos totais: {payload.get('files_total')}\n"
                         f"- arquivos selecionados: {payload.get('files_selected')}\n"
-                        f"- chunks estimados: {payload.get('chunks_total')}"
+                        f"- tamanho total: {self._human_size(int(payload.get('size_total_bytes') or 0))}\n"
+                        f"- tamanho selecionado: {self._human_size(int(payload.get('size_selected_bytes') or 0))}\n"
+                        f"- chunks estimados: {payload.get('chunks_total')} ({payload.get('chunk_unit')})"
                     )
                 elif event == "send_progress":
                     done, total, cno, ctot = payload
                     self.progress_items_var.set(f"enviando item {done} de {total}")
                     self.progress_chunks_var.set(f"batch chunk {cno} de {ctot}")
                 elif event == "send_done":
-                    self._log_send(f"SEND finalizado. Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
+                    status = payload.get("status")
+                    if status == "ALREADY_SENT_PASS":
+                        self._log_send(f"RUN ja enviado com sucesso anteriormente. Run ID: {payload.get('run_id')}")
+                    else:
+                        self._log_send(f"SEND finalizado. Run ID: {payload.get('run_id')} | Status: {status}")
                     self._refresh_run_list()
                 elif event == "val_done":
                     self._log_val(f"VALIDACAO finalizada. Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
