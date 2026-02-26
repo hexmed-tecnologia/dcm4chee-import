@@ -27,22 +27,73 @@ Aplicacao desktop em Tkinter para fluxo DICOM com dois toolkits:
 
 ## Artefatos por run
 
-- `manifest_folders.csv`
-- `manifest_files.csv`
-- `analysis_summary.csv`
+Cada `run_id` agora organiza os artefatos em subpastas:
+
+- `core/`
+  - `manifest_folders.csv`
+  - `manifest_files.csv`
+  - `analysis_summary.csv`
+  - `send_results_by_file.csv`
+  - `send_summary.csv`
+  - `file_iuid_map.csv`
+  - `validation_by_iuid.csv`
+  - `validation_by_file.csv`
+  - `send_checkpoint.json`
+  - `batch_args/`
+- `telemetry/`
+  - `events.csv` (telemetria consolidada do run)
+  - `storescu_execucao.log`
+- `reports/`
+  - `reconciliation_report.csv`
+  - `validation_full_report_A.csv` (quando exportado no modo A)
+  - `validation_full_report_C.csv` (quando exportado no modo C)
+
+Compatibilidade: runs antigos sem subpastas continuam sendo lidos automaticamente (fallback para layout legado).
+
+## Telemetria consolidada por run
+
+Arquivo principal:
+
+- `telemetry/events.csv`
+
+Cabeçalho:
+
+- `run_id`
+- `event_type`
+- `timestamp_iso`
+- `message`
+- `ref`
+
+Cada linha registra um evento do fluxo (`Analise`, `Send`, validação de consistência). Os CSVs abaixo não são mais gerados para telemetria a partir de agora:
+
 - `analysis_events.csv`
-- `storescu_execucao.log`
 - `send_events.csv`
-- `send_results_by_file.csv`
 - `send_errors.csv`
-- `file_iuid_map.csv`
-- `send_summary.csv`
 - `consistency_events.csv`
-- `validation_by_iuid.csv`
-- `validation_by_file.csv`
-- `validation_full_report_A.csv` (quando exportado no modo A)
-- `validation_full_report_C.csv` (quando exportado no modo C)
-- `reconciliation_report.csv`
+
+Exemplos práticos de leitura:
+
+- Início e fim da análise: `ANALYSIS_END`, `ANALYSIS_CANCELLED`
+- Envio:
+  - `RUN_SEND_START`, `CHUNK_START`, `CHUNK_END`, `RUN_SEND_END`
+  - Falha por item: `SEND_FILE_ERROR` (use `ref` para localizar `file_path` e `error_type`)
+- Consistência/validação: `CONSISTENCY_FILLED`, `CONSISTENCY_MISSING`
+- Execução sem trabalho novo: `RUN_SEND_SKIP_ALREADY_COMPLETED`
+
+Exemplo de fluxo rápido no PowerShell:
+
+```powershell
+$run = "<run_id>"
+Import-Csv "python-multi\runs\$run\telemetry\events.csv" -Delimiter ";" |
+  Sort-Object timestamp_iso |
+  Format-Table timestamp_iso,event_type,ref,message -AutoSize
+```
+
+```powershell
+Import-Csv "python-multi\runs\$run\telemetry\events.csv" -Delimiter ";" |
+  Where-Object event_type -in @("SEND_FILE_ERROR","RUN_SEND_END","CONSISTENCY_MISSING") |
+  Sort-Object timestamp_iso
+```
 
 ## Relatorio completo (Validacao)
 
@@ -88,8 +139,9 @@ No menu principal ha um item `Sobre` que mostra a versao atual da aplicacao.
 ## Politica de timestamp
 
 - `run_id`: formato BR `ddMMyyyy_HHmmss`
-- CSVs novos: colunas padrao `timestamp_br` e `timestamp_iso`
-- Campos legados de data/hora (`generated_at`, `processed_at`, etc.) ficam em BR para leitura humana
+- `events.csv` usa `timestamp_iso` como coluna padrão.
+- Demais CSVs novos continuam com o padrão da aplicação (`timestamp_br` e `timestamp_iso`) quando aplicável.
+- Campos legados de data/hora (`generated_at`, `processed_at`, etc.) ficam em BR para leitura humana.
 
 ## Toolkit Minimal
 

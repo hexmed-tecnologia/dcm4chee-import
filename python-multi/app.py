@@ -162,6 +162,122 @@ def write_csv_table(path: Path, rows: list[dict], fieldnames: list[str]) -> None
             writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
+RUN_SUBDIR_CORE = "core"
+RUN_SUBDIR_TELEMETRY = "telemetry"
+RUN_SUBDIR_REPORTS = "reports"
+
+RUN_ARTIFACT_SUBDIR: dict[str, str] = {
+    "manifest_folders.csv": RUN_SUBDIR_CORE,
+    "manifest_files.csv": RUN_SUBDIR_CORE,
+    "analysis_summary.csv": RUN_SUBDIR_CORE,
+    "send_results_by_file.csv": RUN_SUBDIR_CORE,
+    "send_summary.csv": RUN_SUBDIR_CORE,
+    "file_iuid_map.csv": RUN_SUBDIR_CORE,
+    "validation_by_iuid.csv": RUN_SUBDIR_CORE,
+    "validation_by_file.csv": RUN_SUBDIR_CORE,
+    "send_checkpoint.json": RUN_SUBDIR_CORE,
+    "events.csv": RUN_SUBDIR_TELEMETRY,
+    # Legacy telemetry files (kept only for cleanup/fallback compatibility).
+    "analysis_events.csv": RUN_SUBDIR_TELEMETRY,
+    "send_events.csv": RUN_SUBDIR_TELEMETRY,
+    "send_errors.csv": RUN_SUBDIR_TELEMETRY,
+    "consistency_events.csv": RUN_SUBDIR_TELEMETRY,
+    "storescu_execucao.log": RUN_SUBDIR_TELEMETRY,
+    "reconciliation_report.csv": RUN_SUBDIR_REPORTS,
+    "validation_full_report_A.csv": RUN_SUBDIR_REPORTS,
+    "validation_full_report_C.csv": RUN_SUBDIR_REPORTS,
+}
+
+
+def run_artifact_variants(run_dir: Path, filename: str) -> tuple[Path, Path]:
+    subdir = RUN_ARTIFACT_SUBDIR.get(filename, RUN_SUBDIR_CORE)
+    categorized_path = run_dir / subdir / filename
+    legacy_path = run_dir / filename
+    return categorized_path, legacy_path
+
+
+def resolve_run_artifact_path(
+    run_dir: Path,
+    filename: str,
+    *,
+    for_write: bool,
+    logger=None,
+    keep_legacy_on_write: bool = True,
+) -> Path:
+    categorized_path, legacy_path = run_artifact_variants(run_dir, filename)
+    source = "categorized_default"
+    chosen = categorized_path
+    if for_write:
+        if categorized_path.exists():
+            chosen = categorized_path
+            source = "categorized_existing"
+        elif keep_legacy_on_write and legacy_path.exists():
+            chosen = legacy_path
+            source = "legacy_existing"
+        chosen.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        if categorized_path.exists():
+            chosen = categorized_path
+            source = "categorized_existing"
+        elif legacy_path.exists():
+            chosen = legacy_path
+            source = "legacy_existing"
+    if logger:
+        logger(f"[RUN_PATH_RESOLVE] mode={'write' if for_write else 'read'} file={filename} source={source} path={chosen}")
+    return chosen
+
+
+def cleanup_run_artifact_variants(run_dir: Path, filename: str) -> None:
+    categorized_path, legacy_path = run_artifact_variants(run_dir, filename)
+    for p in [categorized_path, legacy_path]:
+        if p.exists():
+            p.unlink()
+
+
+def resolve_run_batch_args_dir(run_dir: Path, *, for_write: bool, logger=None) -> Path:
+    categorized_dir = run_dir / RUN_SUBDIR_CORE / "batch_args"
+    legacy_dir = run_dir / "batch_args"
+    source = "categorized_default"
+    chosen = categorized_dir
+    if for_write:
+        if categorized_dir.exists():
+            chosen = categorized_dir
+            source = "categorized_existing"
+        elif legacy_dir.exists():
+            chosen = legacy_dir
+            source = "legacy_existing"
+        chosen.mkdir(parents=True, exist_ok=True)
+    else:
+        if categorized_dir.exists():
+            chosen = categorized_dir
+            source = "categorized_existing"
+        elif legacy_dir.exists():
+            chosen = legacy_dir
+            source = "legacy_existing"
+    if logger:
+        logger(f"[RUN_PATH_RESOLVE] mode={'write' if for_write else 'read'} file=batch_args source={source} path={chosen}")
+    return chosen
+
+
+def write_telemetry_event(path: Path, run_id: str, event_type: str, message: str, ref: str = "") -> None:
+    fields = ["run_id", "event_type", "timestamp_iso", "message", "ref"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, delimiter=CSV_SEP)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(
+            {
+                "run_id": run_id,
+                "event_type": event_type,
+                "timestamp_iso": now_iso(),
+                "message": message,
+                "ref": ref,
+            }
+        )
+
+
 def find_toolkit_bin(base_dir: Path, toolkit_prefix: str, filename: str) -> str:
     toolkits_dir = base_dir / "toolkits"
     if not toolkits_dir.exists():
@@ -378,6 +494,7 @@ class AnalyzeWorkflow:
         run = run_id.strip() or now_run_id()
         run_dir = runs_base / run
         run_dir.mkdir(parents=True, exist_ok=True)
+        self._log("[RUN_LAYOUT] mode=analysis layout=core|telemetry|reports")
 
         root = Path(exam_root).resolve()
         if not root.exists():
@@ -385,13 +502,14 @@ class AnalyzeWorkflow:
         if batch_size < 1:
             raise RuntimeError("batch_size deve ser >= 1")
 
-        manifest_folders = run_dir / "manifest_folders.csv"
-        manifest_files = run_dir / "manifest_files.csv"
-        summary = run_dir / "analysis_summary.csv"
-        events = run_dir / "analysis_events.csv"
-        for p in [manifest_folders, manifest_files, summary, events]:
-            if p.exists():
-                p.unlink()
+        for filename in ["manifest_folders.csv", "manifest_files.csv", "analysis_summary.csv", "events.csv"]:
+            cleanup_run_artifact_variants(run_dir, filename)
+        for legacy_name in ["analysis_events.csv", "send_events.csv", "send_errors.csv", "consistency_events.csv"]:
+            cleanup_run_artifact_variants(run_dir, legacy_name)
+        manifest_folders = resolve_run_artifact_path(run_dir, "manifest_folders.csv", for_write=True, logger=self._log)
+        manifest_files = resolve_run_artifact_path(run_dir, "manifest_files.csv", for_write=True, logger=self._log)
+        summary = resolve_run_artifact_path(run_dir, "analysis_summary.csv", for_write=True, logger=self._log)
+        events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
 
         allowed_ext = parse_extensions(self.cfg.allowed_extensions_csv)
         include_no_ext = bool(self.cfg.include_no_extension)
@@ -450,15 +568,12 @@ class AnalyzeWorkflow:
             while dir_stack:
                 if self.cancel_event.is_set():
                     flush_manifest_buffer()
-                    write_csv_row(
+                    write_telemetry_event(
                         events,
-                        {
-                            "run_id": run,
-                            "timestamp": now_br(),
-                            "event_type": "ANALYSIS_CANCELLED",
-                            "message": f"files_scanned={total_files};dirs_processed={dirs_processed}",
-                        },
-                        ["run_id", "timestamp", "event_type", "message"],
+                        run,
+                        "ANALYSIS_CANCELLED",
+                        "Analise cancelada pelo usuario.",
+                        f"files_scanned={total_files};dirs_processed={dirs_processed}",
                     )
                     raise WorkflowCancelled("Analise cancelada pelo usuario.")
 
@@ -604,19 +719,16 @@ class AnalyzeWorkflow:
             },
             summary_fields,
         )
-        write_csv_row(
+        write_telemetry_event(
             events,
-            {
-                "run_id": run,
-                "timestamp": now_br(),
-                "event_type": "ANALYSIS_END",
-                "message": (
-                    f"files_total={total_files};selected_files={selected_files};selected_folders={selected_folder_count};"
-                    f"chunks={chunk_total};chunk_unit={chunk_unit};scan_errors={scan_errors};"
-                    f"collect_size_bytes={'1' if self.cfg.collect_size_bytes else '0'}"
-                ),
-            },
-            ["run_id", "timestamp", "event_type", "message"],
+            run,
+            "ANALYSIS_END",
+            "Analise concluida.",
+            (
+                f"files_total={total_files};selected_files={selected_files};selected_folders={selected_folder_count};"
+                f"chunks={chunk_total};chunk_unit={chunk_unit};scan_errors={scan_errors};"
+                f"collect_size_bytes={'1' if self.cfg.collect_size_bytes else '0'}"
+            ),
         )
 
         self._log(
@@ -695,8 +807,9 @@ class SendWorkflow:
             ts_mode = "AUTO"
         if self.cfg.toolkit == "dcm4che" and not self.cfg.dcm4che_use_shell_wrapper:
             self._log("[WARN] dcm4che sem wrapper de shell ativo (modo experimental).")
+        self._log("[RUN_LAYOUT] mode=send layout=core|telemetry|reports")
 
-        manifest_files = run_dir / "manifest_files.csv"
+        manifest_files = resolve_run_artifact_path(run_dir, "manifest_files.csv", for_write=False, logger=self._log)
         if not manifest_files.exists():
             raise RuntimeError(f"Arquivo nao encontrado: {manifest_files}")
         rows = read_csv_rows(manifest_files)
@@ -710,21 +823,13 @@ class SendWorkflow:
             folder = str(r.get("folder_path", "")).strip() or str(Path(r["file_path"]).parent)
             folder_to_files.setdefault(folder, []).append(Path(r["file_path"]))
 
-        log_file = run_dir / "storescu_execucao.log"
-        send_events = run_dir / "send_events.csv"
-        send_results = run_dir / "send_results_by_file.csv"
-        send_errors = run_dir / "send_errors.csv"
-        file_iuid_map = run_dir / "file_iuid_map.csv"
-        send_summary = run_dir / "send_summary.csv"
-        checkpoint = run_dir / "send_checkpoint.json"
-        args_dir = run_dir / "batch_args"
-        args_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_read = resolve_run_artifact_path(run_dir, "send_checkpoint.json", for_write=False, logger=self._log)
 
         done_units = 0
         done_files = 0
-        if checkpoint.exists():
+        if checkpoint_read.exists():
             try:
-                payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+                payload = json.loads(checkpoint_read.read_text(encoding="utf-8"))
                 done_units = int(payload.get("done_units", payload.get("done_items", 0)))
                 done_files = int(payload.get("done_files", payload.get("done_items", 0)))
             except Exception:
@@ -732,13 +837,28 @@ class SendWorkflow:
                 done_files = 0
 
         if done_units == 0:
-            for p in [log_file, send_events, send_results, send_errors, file_iuid_map, send_summary]:
-                if p.exists():
-                    p.unlink()
+            for filename in [
+                "storescu_execucao.log",
+                "events.csv",
+                "send_results_by_file.csv",
+                "file_iuid_map.csv",
+                "send_summary.csv",
+            ]:
+                cleanup_run_artifact_variants(run_dir, filename)
+            for legacy_name in ["analysis_events.csv", "send_events.csv", "send_errors.csv", "consistency_events.csv"]:
+                cleanup_run_artifact_variants(run_dir, legacy_name)
             self._log(f"RUN_ID envio: {run}")
 
+        log_file = resolve_run_artifact_path(run_dir, "storescu_execucao.log", for_write=True, logger=self._log)
+        events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
+        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
+        file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=True, logger=self._log)
+        send_summary = resolve_run_artifact_path(run_dir, "send_summary.csv", for_write=True, logger=self._log)
+        checkpoint = resolve_run_artifact_path(run_dir, "send_checkpoint.json", for_write=True, logger=self._log)
+        args_dir = resolve_run_batch_args_dir(run_dir, for_write=True, logger=self._log)
+
         if self.cfg.toolkit == "dcm4che":
-            manifest_folders = run_dir / "manifest_folders.csv"
+            manifest_folders = resolve_run_artifact_path(run_dir, "manifest_folders.csv", for_write=False, logger=self._log)
             folder_keys = set(folder_to_files.keys())
             ordered_folders: list[str] = []
             if manifest_folders.exists():
@@ -769,21 +889,9 @@ class SendWorkflow:
                 msg = "Este run nao possui itens pendentes para envio."
                 status = "ALREADY_SENT"
             self._log(msg)
-            write_csv_row(
-                send_events,
-                {
-                    "timestamp": now_br(),
-                    "run_id": run,
-                    "event_type": "RUN_SEND_SKIP_ALREADY_COMPLETED",
-                    "chunk_no": "",
-                    "message": msg,
-                    "extra": f"prev_status={prev_status or 'N/A'}",
-                },
-                ["timestamp", "run_id", "event_type", "chunk_no", "message", "extra"],
-            )
+            write_telemetry_event(events, run, "RUN_SEND_SKIP_ALREADY_COMPLETED", msg, f"prev_status={prev_status or 'N/A'}")
             return {"run_id": run, "status": status, "run_dir": str(run_dir)}
 
-        event_fields = ["timestamp", "run_id", "event_type", "chunk_no", "message", "extra"]
         result_fields = [
             "run_id",
             "file_path",
@@ -797,13 +905,14 @@ class SendWorkflow:
             "source_ts_name",
             "processed_at",
         ]
-        error_fields = ["run_id", "file_path", "chunk_no", "error_type", "message", "logged_at"]
         map_fields = ["run_id", "file_path", "sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status", "mapped_at"]
 
-        write_csv_row(
-            send_events,
-            {"timestamp": now_br(), "run_id": run, "event_type": "RUN_SEND_START", "chunk_no": "", "message": "Envio iniciado", "extra": f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit}"},
-            event_fields,
+        write_telemetry_event(
+            events,
+            run,
+            "RUN_SEND_START",
+            "Envio iniciado.",
+            f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit}",
         )
 
         sent_ok = 0
@@ -829,10 +938,12 @@ class SendWorkflow:
             last_item = min(item_cursor + len(batch_files), total_items)
             self.progress_callback(first_item, total_items, chunk_index, total_chunks)
             self._log(f"Chunk {chunk_index}/{total_chunks} - enviando itens {first_item} ate {last_item} de {total_items}")
-            write_csv_row(
-                send_events,
-                {"timestamp": now_br(), "run_id": run, "event_type": "CHUNK_START", "chunk_no": chunk_index, "message": "Chunk iniciado", "extra": f"items={len(batch_files)};units={len(batch_inputs)}"},
-                event_fields,
+            write_telemetry_event(
+                events,
+                run,
+                "CHUNK_START",
+                "Chunk iniciado.",
+                f"chunk_no={chunk_index};items={len(batch_files)};units={len(batch_inputs)}",
             )
 
             args_file = args_dir / f"batch_{chunk_index:06d}.txt"
@@ -923,17 +1034,12 @@ class SendWorkflow:
                         result_fields,
                     )
                     if status != "SENT_OK":
-                        write_csv_row(
-                            send_errors,
-                            {
-                                "run_id": run,
-                                "file_path": fp,
-                                "chunk_no": chunk_index,
-                                "error_type": status,
-                                "message": detail,
-                                "logged_at": now_br(),
-                            },
-                            error_fields,
+                        write_telemetry_event(
+                            events,
+                            run,
+                            "SEND_FILE_ERROR",
+                            detail or status,
+                            f"chunk_no={chunk_index};file_path={fp};error_type={status}",
                         )
                     if iuid:
                         write_csv_row(
@@ -993,17 +1099,12 @@ class SendWorkflow:
                         result_fields,
                     )
                     if status != "SENT_OK":
-                        write_csv_row(
-                            send_errors,
-                            {
-                                "run_id": run,
-                                "file_path": fp,
-                                "chunk_no": chunk_index,
-                                "error_type": status,
-                                "message": detail,
-                                "logged_at": now_br(),
-                            },
-                            error_fields,
+                        write_telemetry_event(
+                            events,
+                            run,
+                            "SEND_FILE_ERROR",
+                            detail or status,
+                            f"chunk_no={chunk_index};file_path={fp};error_type={status}",
                         )
                     if iuid:
                         write_csv_row(
@@ -1029,17 +1130,12 @@ class SendWorkflow:
                 ),
                 encoding="utf-8",
             )
-            write_csv_row(
-                send_events,
-                {
-                    "timestamp": now_br(),
-                    "run_id": run,
-                    "event_type": "CHUNK_END",
-                    "chunk_no": chunk_index,
-                    "message": "Chunk concluido",
-                    "extra": f"exit_code={exit_code}",
-                },
-                event_fields,
+            write_telemetry_event(
+                events,
+                run,
+                "CHUNK_END",
+                "Chunk concluido.",
+                f"chunk_no={chunk_index};exit_code={exit_code}",
             )
 
         final_status = "INTERRUPTED" if interrupted else ("PASS" if failed == 0 and warned == 0 else ("PASS_WITH_WARNINGS" if failed == 0 else "FAIL"))
@@ -1059,11 +1155,7 @@ class SendWorkflow:
             },
             ["run_id", "toolkit", "ts_mode_effective", "total_items", "items_processed", "sent_ok", "warnings", "failed", "status", "finished_at"],
         )
-        write_csv_row(
-            send_events,
-            {"timestamp": now_br(), "run_id": run, "event_type": "RUN_SEND_END", "chunk_no": "", "message": "Envio finalizado", "extra": f"status={final_status}"},
-            event_fields,
-        )
+        write_telemetry_event(events, run, "RUN_SEND_END", "Envio finalizado.", f"status={final_status}")
         self._log(f"Resumo envio: ok={sent_ok} warn={warned} fail={failed} status={final_status}")
         return {"run_id": run, "status": final_status, "run_dir": str(run_dir)}
 
@@ -1155,9 +1247,10 @@ class ValidationWorkflow:
         run_dir = self._resolve_runs_base(script_dir) / run
         if not run_dir.exists():
             raise RuntimeError(f"Run nao encontrado: {run_dir}")
+        self._log("[RUN_LAYOUT] mode=report_export layout=core|telemetry|reports")
 
-        send_results = run_dir / "send_results_by_file.csv"
-        file_iuid_map = run_dir / "file_iuid_map.csv"
+        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=False, logger=self._log)
+        file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=True, logger=self._log)
         if not send_results.exists():
             raise RuntimeError(f"Arquivo nao encontrado: {send_results}")
 
@@ -1258,7 +1351,9 @@ class ValidationWorkflow:
             )
 
         if mode == "A":
-            report_file = run_dir / "validation_full_report_A.csv"
+            report_file = resolve_run_artifact_path(
+                run_dir, "validation_full_report_A.csv", for_write=True, logger=self._log, keep_legacy_on_write=False
+            )
             fieldnames = [
                 "run_id",
                 "file_path",
@@ -1307,7 +1402,9 @@ class ValidationWorkflow:
                 agg["status"] = "ERRO"
 
         rows_c = sorted(grouped.values(), key=lambda x: str(x.get("study_uid", "")))
-        report_file = run_dir / "validation_full_report_C.csv"
+        report_file = resolve_run_artifact_path(
+            run_dir, "validation_full_report_C.csv", for_write=True, logger=self._log, keep_legacy_on_write=False
+        )
         fieldnames = [
             "run_id",
             "study_uid",
@@ -1334,16 +1431,16 @@ class ValidationWorkflow:
         run_dir = self._resolve_runs_base(script_dir) / run
         if not run_dir.exists():
             raise RuntimeError(f"Run nao encontrado: {run_dir}")
+        self._log("[RUN_LAYOUT] mode=validation layout=core|telemetry|reports")
 
-        send_results = run_dir / "send_results_by_file.csv"
-        file_iuid_map = run_dir / "file_iuid_map.csv"
-        val_iuid = run_dir / "validation_by_iuid.csv"
-        val_file = run_dir / "validation_by_file.csv"
-        recon = run_dir / "reconciliation_report.csv"
-        consistency = run_dir / "consistency_events.csv"
-        for p in [val_iuid, val_file, recon, consistency]:
-            if p.exists():
-                p.unlink()
+        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=False, logger=self._log)
+        file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=True, logger=self._log)
+        for filename in ["validation_by_iuid.csv", "validation_by_file.csv", "reconciliation_report.csv"]:
+            cleanup_run_artifact_variants(run_dir, filename)
+        events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
+        val_iuid = resolve_run_artifact_path(run_dir, "validation_by_iuid.csv", for_write=True, logger=self._log)
+        val_file = resolve_run_artifact_path(run_dir, "validation_by_file.csv", for_write=True, logger=self._log)
+        recon = resolve_run_artifact_path(run_dir, "reconciliation_report.csv", for_write=True, logger=self._log)
 
         send_rows = read_csv_rows(send_results)
         map_rows = read_csv_rows(file_iuid_map)
@@ -1366,8 +1463,6 @@ class ValidationWorkflow:
         self._log(f"Mapeamentos IUID atuais: {len(map_by_file)}")
 
         map_fields = ["run_id", "file_path", "sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status", "mapped_at"]
-        cons_fields = ["timestamp", "run_id", "event_type", "file_path", "message"]
-
         # consistency check: complete missing IUIDs before API calls
         for row in send_rows:
             if row.get("send_status", "") != "SENT_OK":
@@ -1391,16 +1486,20 @@ class ValidationWorkflow:
                     },
                     map_fields,
                 )
-                write_csv_row(
-                    consistency,
-                    {"timestamp": now_br(), "run_id": run, "event_type": "CONSISTENCY_FILLED", "file_path": fp, "message": "IUID preenchido antes da validacao"},
-                    cons_fields,
+                write_telemetry_event(
+                    events,
+                    run,
+                    "CONSISTENCY_FILLED",
+                    "IUID preenchido antes da validacao.",
+                    f"file_path={fp}",
                 )
             else:
-                write_csv_row(
-                    consistency,
-                    {"timestamp": now_br(), "run_id": run, "event_type": "CONSISTENCY_MISSING", "file_path": fp, "message": err or "nao foi possivel extrair IUID"},
-                    cons_fields,
+                write_telemetry_event(
+                    events,
+                    run,
+                    "CONSISTENCY_MISSING",
+                    err or "Nao foi possivel extrair IUID.",
+                    f"file_path={fp}",
                 )
 
         iuid_to_files: dict[str, list[str]] = {}
