@@ -45,7 +45,7 @@ class AppConfig:
     # Internal runtime values (always resolved from local "toolkits" folder).
     dcm4che_bin_path: str = ""
     dcmtk_bin_path: str = ""
-    aet_origem: str = "STORESCU"
+    aet_origem: str = "HMD_IMPORTER"
     aet_destino: str = "HMD_IMPORTED"
     pacs_host: str = "192.168.1.70"
     pacs_port: int = 5555
@@ -54,8 +54,9 @@ class AppConfig:
     batch_size_default: int = 200
     nivel_log_minimo: str = "INFO"
     allowed_extensions_csv: str = ".dcm"
+    restrict_extensions: bool = True
     include_no_extension: bool = True
-    collect_size_bytes: bool = True
+    collect_size_bytes: bool = False
     ts_mode: str = "AUTO"
     # Internal flag: keep Windows-stable wrapper for .bat execution by default.
     dcm4che_use_shell_wrapper: bool = True
@@ -513,8 +514,17 @@ class AnalyzeWorkflow:
 
         allowed_ext = parse_extensions(self.cfg.allowed_extensions_csv)
         include_no_ext = bool(self.cfg.include_no_extension)
+        restrict_extensions = bool(self.cfg.restrict_extensions)
         self._log(f"RUN_ID analise: {run}")
         self._log("Iniciando descoberta de arquivos...")
+        if restrict_extensions:
+            ext_text = ",".join(sorted(allowed_ext)) if allowed_ext else "<nenhuma_extensao>"
+            self._log(
+                f"[AN_FILTER_MODE] mode=extensions allowed={ext_text} "
+                f"include_no_extension={'ON' if include_no_ext else 'OFF'}"
+            )
+        else:
+            self._log("[AN_FILTER_MODE] mode=all_files include_no_extension=IGNORED")
         self._log(
             f"[AN_SCAN_CONFIG] collect_size_bytes={'ON' if self.cfg.collect_size_bytes else 'OFF'} "
             "(OFF melhora performance em arvores muito grandes)"
@@ -601,8 +611,16 @@ class AnalyzeWorkflow:
 
                             ext = Path(entry.name).suffix.lower()
                             no_ext = ext == ""
-                            include = (ext in allowed_ext) or (no_ext and include_no_ext)
-                            reason = "INCLUDED_EXT" if ext in allowed_ext else ("INCLUDED_NO_EXT" if (no_ext and include_no_ext) else "EXCLUDED_EXTENSION")
+                            if restrict_extensions:
+                                include = (ext in allowed_ext) or (no_ext and include_no_ext)
+                                reason = (
+                                    "INCLUDED_EXT"
+                                    if ext in allowed_ext
+                                    else ("INCLUDED_NO_EXT" if (no_ext and include_no_ext) else "EXCLUDED_EXTENSION")
+                                )
+                            else:
+                                include = True
+                                reason = "INCLUDED_ALL_FILES"
                             if include:
                                 selected_files += 1
                                 selected_bytes += size
@@ -839,7 +857,6 @@ class SendWorkflow:
         if done_units == 0:
             for filename in [
                 "storescu_execucao.log",
-                "events.csv",
                 "send_results_by_file.csv",
                 "file_iuid_map.csv",
                 "send_summary.csv",
@@ -1640,34 +1657,52 @@ class ConfigDialog(tk.Toplevel):
         self.var_host = tk.StringVar(value=config.pacs_host)
         self.var_port = tk.StringVar(value=str(config.pacs_port))
         self.var_rest = tk.StringVar(value=config.pacs_rest_host)
-        self.var_runs = tk.StringVar(value=config.runs_base_dir)
         self.var_batch = tk.StringVar(value=str(config.batch_size_default))
         self.var_ext = tk.StringVar(value=config.allowed_extensions_csv)
+        self.var_include_all_files = tk.BooleanVar(value=not bool(config.restrict_extensions))
         self.var_no_ext = tk.BooleanVar(value=bool(config.include_no_extension))
         self.var_collect_size = tk.BooleanVar(value=bool(config.collect_size_bytes))
         self.var_ts = tk.StringVar(value=config.ts_mode)
 
         frm = ttk.Frame(self, padding=12)
         frm.grid(sticky="nsew")
+        frm.columnconfigure(1, weight=1)
         self._row_entry(frm, 0, "Toolkit", self.var_toolkit, combo_values=["dcm4che", "dcmtk"])
         self._row_entry(frm, 1, "AET origem", self.var_aet_src)
         self._row_entry(frm, 2, "AET destino", self.var_aet_dst)
-        self._row_entry(frm, 3, "PACS host", self.var_host)
-        self._row_entry(frm, 4, "PACS port", self.var_port)
+        self._row_entry(frm, 3, "PACS DICOM host (C-STORE)", self.var_host)
+        self._row_entry(frm, 4, "PACS DICOM port (C-STORE)", self.var_port)
         self._row_entry(frm, 5, "PACS REST host:porta", self.var_rest)
-        self._row_entry(frm, 6, "Runs base dir", self.var_runs, browse=True)
-        self._row_entry(frm, 7, "Batch default", self.var_batch)
-        self._row_entry(frm, 8, "Extensoes permitidas (csv)", self.var_ext)
-        ttk.Checkbutton(frm, text="Incluir arquivos sem extensao", variable=self.var_no_ext).grid(row=9, column=0, columnspan=2, sticky="w")
+        self._row_entry(frm, 6, "Batch default", self.var_batch)
+
+        filter_frame = ttk.LabelFrame(frm, text="Filtro de arquivos para analise", padding=8)
+        filter_frame.grid(row=7, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        filter_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            filter_frame,
+            text="Nao restringir por extensao (incluir todos os arquivos)",
+            variable=self.var_include_all_files,
+            command=self._toggle_extension_controls,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            filter_frame,
+            text="Extensoes permitidas (separadas por virgula, ex: .dcm,.ima)",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 3))
+        self.entry_ext = ttk.Entry(filter_frame, textvariable=self.var_ext, width=58)
+        self.entry_ext.grid(row=1, column=1, sticky="we", pady=(6, 3))
+        self.chk_no_ext = ttk.Checkbutton(filter_frame, text="Incluir arquivos sem extensao", variable=self.var_no_ext)
+        self.chk_no_ext.grid(row=2, column=0, columnspan=2, sticky="w")
+
         ttk.Checkbutton(
             frm,
             text="Calcular size_bytes na analise (mais lento)",
             variable=self.var_collect_size,
-        ).grid(row=10, column=0, columnspan=2, sticky="w")
-        self._row_entry(frm, 11, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
+        ).grid(row=8, column=0, columnspan=2, sticky="w")
+        self._row_entry(frm, 9, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
+        self._toggle_extension_controls()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=12, column=0, columnspan=3, pady=(12, 0), sticky="e")
+        btns.grid(row=10, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btns, text="Testar Echo", command=self._test_echo).pack(side="left", padx=4)
         ttk.Button(btns, text="Salvar", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Fechar", command=self.destroy).pack(side="left", padx=4)
@@ -1681,11 +1716,17 @@ class ConfigDialog(tk.Toplevel):
         w.grid(row=row, column=1, sticky="we", pady=3)
         if browse:
             ttk.Button(parent, text="...", width=3, command=lambda: self._browse(var)).grid(row=row, column=2, padx=(4, 0))
+        return w
 
     def _browse(self, var):
         p = filedialog.askdirectory(parent=self)
         if p:
             var.set(p)
+
+    def _toggle_extension_controls(self):
+        state = "disabled" if bool(self.var_include_all_files.get()) else "normal"
+        self.entry_ext.configure(state=state)
+        self.chk_no_ext.configure(state=state)
 
     def _build_config(self) -> AppConfig:
         return AppConfig(
@@ -1695,9 +1736,9 @@ class ConfigDialog(tk.Toplevel):
             pacs_host=self.var_host.get().strip(),
             pacs_port=int(self.var_port.get().strip()),
             pacs_rest_host=self.var_rest.get().strip(),
-            runs_base_dir=self.var_runs.get().strip(),
             batch_size_default=int(self.var_batch.get().strip()),
             allowed_extensions_csv=self.var_ext.get().strip(),
+            restrict_extensions=not bool(self.var_include_all_files.get()),
             include_no_extension=bool(self.var_no_ext.get()),
             collect_size_bytes=bool(self.var_collect_size.get()),
             ts_mode=self.var_ts.get().strip(),
@@ -1759,6 +1800,10 @@ class App(tk.Tk):
                 cfg = AppConfig(**{**asdict(cfg), **raw})
             except Exception:
                 pass
+        if cfg.aet_origem.strip().upper() == "STORESCU":
+            cfg.aet_origem = "HMD_IMPORTER"
+        # Keep runs local to the app by default; this setting is no longer exposed in UI.
+        cfg.runs_base_dir = ""
         apply_internal_toolkit_paths(cfg, self.base_dir)
         return cfg
 
@@ -1766,6 +1811,13 @@ class App(tk.Tk):
         self.config_obj = cfg
         self.config_file.write_text(json.dumps(asdict(cfg), ensure_ascii=True, indent=2), encoding="utf-8")
         self.var_batch_size.set(str(cfg.batch_size_default))
+        self._log_an(
+            f"[CFG_SAVE] toolkit={cfg.toolkit} aet_origem={cfg.aet_origem} aet_destino={cfg.aet_destino} "
+            f"pacs_dicom={cfg.pacs_host}:{cfg.pacs_port} pacs_rest={cfg.pacs_rest_host} "
+            f"batch={cfg.batch_size_default} restrict_extensions={'ON' if cfg.restrict_extensions else 'OFF'} "
+            f"include_no_extension={'ON' if cfg.include_no_extension else 'OFF'} "
+            f"collect_size_bytes={'ON' if cfg.collect_size_bytes else 'OFF'}"
+        )
         self._log_an("Configuracoes atualizadas.")
         self._refresh_run_list()
 

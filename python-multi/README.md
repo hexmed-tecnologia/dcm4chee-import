@@ -113,13 +113,18 @@ Campos principais exportados:
 No menu `Configuracao -> Configuracoes`:
 
 - Toolkit ativo (`dcm4che` ou `dcmtk`)
-- AET origem, AET destino
-- Host e porta do PACS
+- AET origem (padrao: `HMD_IMPORTER`), AET destino
+- PACS DICOM host (C-STORE) e PACS DICOM port (C-STORE)
 - Host REST para validacao
 - Tamanho de batch
 - Regras de indexacao por extensao
-- Opcao de calcular `size_bytes` na analise (desative para melhorar performance em arvores muito grandes)
+  - lista separada por virgula, ex.: `.dcm,.ima,.dicom`
+  - opcao `Nao restringir por extensao (incluir todos os arquivos)` (desmarcada por padrao)
+  - opcao `Incluir arquivos sem extensao` (aplicada quando a restricao por extensao estiver ativa)
+- Opcao de calcular `size_bytes` na analise (desmarcada por padrao para melhor performance)
 - Modo TS (`AUTO`, `JPEG_LS_LOSSLESS`, `UNCOMPRESSED_STANDARD`)
+
+Observacao: o campo `Runs base dir` nao e mais exibido na interface. O app usa o caminho local padrao `python-multi/runs`.
 
 Observacao: nesta versao, apenas `AUTO` esta ativo. Os demais modos estao estruturados para evolucao futura.
 As toolkits sao sempre resolvidas internamente em `toolkits/<nome>-*/bin` relativo ao app (sem configuracao manual de path).
@@ -228,5 +233,7 @@ Use:
 
 Saida em:
 
-- `build-scripts\artifacts\dist\<timestamp>\DicomMultiToolkit\DicomMultiToolkit.exe`
+- `build-scripts\dist\<timestamp_br>\DicomMultiToolkit\DicomMultiToolkit.exe`
+
+Formato de `<timestamp_br>`: `ddMMyyyy_HHmmss`
 

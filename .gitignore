@@ -7,3 +7,4 @@ dcm4che-5.34.2/
 dcmtk-*/
 **/dcmtk-*/
 python-multi/runs/
+python-multi/build-scripts/dist/

@@ -10,7 +10,7 @@ set "TOOLKITS_DIR=%PROJECT_DIR%\toolkits"
 
 set "ARTIFACTS_DIR=%SCRIPT_DIR%artifacts"
 set "VENV_DIR=%ARTIFACTS_DIR%\.venv-build"
-set "DIST_ROOT=%ARTIFACTS_DIR%\dist"
+set "DIST_ROOT=%SCRIPT_DIR%dist"
 set "BUILD_DIR=%ARTIFACTS_DIR%\build"
 set "SPEC_DIR=%ARTIFACTS_DIR%\spec"
 
@@ -48,7 +48,7 @@ if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 if exist "%SPEC_DIR%" rmdir /s /q "%SPEC_DIR%"
 mkdir "%SPEC_DIR%"
 
-for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString(\"yyyyMMdd_HHmmss\")"') do set "BUILD_STAMP=%%i"
+for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString(\"ddMMyyyy_HHmmss\")"') do set "BUILD_STAMP=%%i"
 set "DIST_DIR=%DIST_ROOT%\%BUILD_STAMP%"
 mkdir "%DIST_DIR%"
 
