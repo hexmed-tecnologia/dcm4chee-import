@@ -19,14 +19,25 @@ from urllib import request as urlrequest
 CSV_SEP = ";"
 APP_DISPLAY_NAME = "DICOM Multi Toolkit"
 
-DCM4CHE_SUCCESS_REGEX = re.compile(r"status=0H[\s\S]*?iuid=([\d\.]+)", re.IGNORECASE)
-DCM4CHE_ERROR_REGEX = re.compile(r"status=[^0][A-F0-9]*H[\s\S]*?iuid=([\d\.]+)", re.IGNORECASE)
+DCM4CHE_STORE_RQ_RE = re.compile(
+    r"<<\s+\d+:C-STORE-RQ\[[\s\S]*?iuid=([0-9]+(?:\.[0-9]+)+)\s+-",
+    re.IGNORECASE,
+)
+DCM4CHE_STORE_RSP_OK_RE = re.compile(
+    r">>\s+\d+:C-STORE-RSP\[[\s\S]*?status=0H[\s\S]*?iuid=([0-9]+(?:\.[0-9]+)+)\s+-",
+    re.IGNORECASE,
+)
+DCM4CHE_STORE_RSP_ERR_RE = re.compile(
+    r">>\s+\d+:C-STORE-RSP\[[\s\S]*?status=(?!0H)([A-F0-9]+H)[\s\S]*?iuid=([0-9]+(?:\.[0-9]+)+)\s+-",
+    re.IGNORECASE,
+)
 
 DCMTK_SENDING_FILE_RE = re.compile(r"I:\s+Sending file:\s+(.+)$")
 DCMTK_BAD_FILE_RE = re.compile(r"E:\s+Bad DICOM file:\s+(.+?):\s*(.+)$")
 DCMTK_STORE_RSP_RE = re.compile(r"I:\s+Received Store Response\s+\((.+)\)$")
-UID_TAG_0008_0018 = re.compile(r"\(0008,0018\).*?\[([^\]]+)\]")
-UID_TAG_0002_0010 = re.compile(r"\(0002,0010\).*?\[([^\]]+)\]")
+UID_TAG_0008_0018 = re.compile(r"\(0008,0018\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
+UID_TAG_0002_0010 = re.compile(r"\(0002,0010\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
+UID_VALUE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)+")
 IS_WINDOWS = os.name == "nt"
 
 
@@ -58,6 +69,7 @@ class AppConfig:
     include_no_extension: bool = True
     collect_size_bytes: bool = False
     ts_mode: str = "AUTO"
+    dcm4che_send_mode: str = "MANIFEST_FILES"
     # Internal flag: keep Windows-stable wrapper for .bat execution by default.
     dcm4che_use_shell_wrapper: bool = True
 
@@ -77,6 +89,72 @@ def now_dual_timestamp() -> tuple[str, str]:
 
 def now_run_id() -> str:
     return datetime.now().strftime("%d%m%Y_%H%M%S")
+
+
+def sanitize_uid(value: str) -> str:
+    m = UID_VALUE_RE.search((value or "").strip())
+    return m.group(0).strip() if m else ""
+
+
+def looks_like_dicom_payload_file(file_path: Path) -> bool:
+    name_up = file_path.name.upper()
+    if name_up == "DICOMDIR":
+        return False
+    ext = file_path.suffix.lower()
+    if ext in [".dcm", ".dicom", ".ima"]:
+        return True
+    if not ext and sanitize_uid(file_path.name):
+        return True
+    return False
+
+
+def normalize_dcm4che_send_mode(mode: str) -> str:
+    m = (mode or "").strip().upper()
+    if m in ["FILES", "MANIFEST_FILES"]:
+        return "MANIFEST_FILES"
+    return "FOLDERS"
+
+
+def toolkit_run_suffix(toolkit: str, dcm4che_send_mode: str = "MANIFEST_FILES") -> str:
+    t = (toolkit or "").strip().lower()
+    if t == "dcm4che":
+        return "dcm4che_files" if normalize_dcm4che_send_mode(dcm4che_send_mode) == "MANIFEST_FILES" else "dcm4che_folders"
+    if t == "dcmtk":
+        return "dcmtk"
+    return re.sub(r"[^a-z0-9]+", "_", t).strip("_") or "toolkit"
+
+
+def strip_known_run_suffixes(run_id: str) -> str:
+    base = (run_id or "").strip()
+    if not base:
+        return base
+    known_suffixes = [
+        "_dcm4che_folders",
+        "_dcm4che_files",
+        "_dcm4che",
+        "_dcmtk",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        lower = base.lower()
+        for suffix in known_suffixes:
+            if lower.endswith(suffix):
+                base = base[: -len(suffix)].rstrip("_")
+                changed = True
+                break
+    return base
+
+
+def send_checkpoint_filename(cfg: AppConfig) -> str:
+    toolkit = (cfg.toolkit or "").strip().lower()
+    if toolkit == "dcm4che":
+        mode = normalize_dcm4che_send_mode(cfg.dcm4che_send_mode)
+        mode_suffix = "files" if mode == "MANIFEST_FILES" else "folders"
+        return f"send_checkpoint_dcm4che_{mode_suffix}.json"
+    if toolkit == "dcmtk":
+        return "send_checkpoint_dcmtk.json"
+    return f"send_checkpoint_{toolkit_run_suffix(cfg.toolkit, cfg.dcm4che_send_mode)}.json"
 
 
 def format_eta(seconds: float | None) -> str:
@@ -173,10 +251,15 @@ RUN_ARTIFACT_SUBDIR: dict[str, str] = {
     "analysis_summary.csv": RUN_SUBDIR_CORE,
     "send_results_by_file.csv": RUN_SUBDIR_CORE,
     "send_summary.csv": RUN_SUBDIR_CORE,
+    "validation_results.csv": RUN_SUBDIR_CORE,
+    # Legacy core files (kept only for cleanup/fallback compatibility).
     "file_iuid_map.csv": RUN_SUBDIR_CORE,
     "validation_by_iuid.csv": RUN_SUBDIR_CORE,
     "validation_by_file.csv": RUN_SUBDIR_CORE,
     "send_checkpoint.json": RUN_SUBDIR_CORE,
+    "send_checkpoint_dcm4che_folders.json": RUN_SUBDIR_CORE,
+    "send_checkpoint_dcm4che_files.json": RUN_SUBDIR_CORE,
+    "send_checkpoint_dcmtk.json": RUN_SUBDIR_CORE,
     "events.csv": RUN_SUBDIR_TELEMETRY,
     # Legacy telemetry files (kept only for cleanup/fallback compatibility).
     "analysis_events.csv": RUN_SUBDIR_TELEMETRY,
@@ -279,6 +362,76 @@ def write_telemetry_event(path: Path, run_id: str, event_type: str, message: str
         )
 
 
+def build_iuid_map_from_send_rows(send_rows: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for row in send_rows:
+        fp = str(row.get("file_path", "")).strip()
+        iuid = str(row.get("sop_instance_uid", "")).strip()
+        if not fp or not iuid:
+            continue
+        out[fp] = {
+            "sop_instance_uid": iuid,
+            "source_ts_uid": str(row.get("source_ts_uid", "")).strip(),
+            "source_ts_name": str(row.get("source_ts_name", "")).strip(),
+            "extract_status": str(row.get("extract_status", "")).strip(),
+        }
+    return out
+
+
+def merge_iuid_map_from_legacy_file(map_by_file: dict[str, dict], legacy_map_path: Path) -> None:
+    if not legacy_map_path.exists():
+        return
+    for row in read_csv_rows(legacy_map_path):
+        fp = str(row.get("file_path", "")).strip()
+        iuid = str(row.get("sop_instance_uid", "")).strip()
+        if not fp or not iuid or fp in map_by_file:
+            continue
+        map_by_file[fp] = {
+            "sop_instance_uid": iuid,
+            "source_ts_uid": str(row.get("source_ts_uid", "")).strip(),
+            "source_ts_name": str(row.get("source_ts_name", "")).strip(),
+            "extract_status": str(row.get("extract_status", "")).strip(),
+        }
+
+
+def apply_send_result_updates(send_results_path: Path, run_id: str, updates_by_file: dict[str, dict]) -> int:
+    if not updates_by_file or not send_results_path.exists():
+        return 0
+    rows = read_csv_rows(send_results_path)
+    if not rows:
+        return 0
+
+    changed_rows = 0
+    update_keys = ["sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status"]
+    for row in rows:
+        if str(row.get("run_id", "")).strip() != run_id:
+            continue
+        fp = str(row.get("file_path", "")).strip()
+        if not fp:
+            continue
+        upd = updates_by_file.get(fp)
+        if not upd:
+            continue
+        row_changed = False
+        for key in update_keys:
+            new_val = str(upd.get(key, "")).strip()
+            if not new_val:
+                continue
+            if str(row.get(key, "")).strip() != new_val:
+                row[key] = new_val
+                row_changed = True
+        if row_changed:
+            changed_rows += 1
+
+    if changed_rows > 0:
+        fieldnames = list(rows[0].keys())
+        for key in update_keys:
+            if key not in fieldnames:
+                fieldnames.append(key)
+        write_csv_table(send_results_path, rows, fieldnames)
+    return changed_rows
+
+
 def find_toolkit_bin(base_dir: Path, toolkit_prefix: str, filename: str) -> str:
     toolkits_dir = base_dir / "toolkits"
     if not toolkits_dir.exists():
@@ -372,15 +525,25 @@ class Dcm4cheDriver(ToolkitDriver):
         out = self.dcmdump_text(["cmd", "/c", str(dcmdump), str(file_path)])
         iuid_m = UID_TAG_0008_0018.search(out)
         ts_m = UID_TAG_0002_0010.search(out)
-        iuid = iuid_m.group(1).strip() if iuid_m else ""
-        ts_uid = ts_m.group(1).strip() if ts_m else ""
+        iuid = sanitize_uid(iuid_m.group(1) if iuid_m else "")
+        ts_uid = sanitize_uid(ts_m.group(1) if ts_m else "")
         return iuid, ts_uid, ts_uid, ""
 
     def parse_send_output(self, lines: list[str], batch_files: list[Path]) -> dict[str, dict]:
         blob = "\n".join(lines)
-        ok_iuids = [x.strip() for x in DCM4CHE_SUCCESS_REGEX.findall(blob) if x.strip()]
-        err_iuids = [x.strip() for x in DCM4CHE_ERROR_REGEX.findall(blob) if x.strip()]
-        return {"__batch__": {"ok_iuids": ok_iuids, "err_iuids": err_iuids}}
+        rq_iuids = [x.strip() for x in DCM4CHE_STORE_RQ_RE.findall(blob) if x.strip()]
+        ok_iuids = [x.strip() for x in DCM4CHE_STORE_RSP_OK_RE.findall(blob) if x.strip()]
+        err_matches = DCM4CHE_STORE_RSP_ERR_RE.findall(blob)
+        err_iuids = [uid.strip() for _status, uid in err_matches if uid.strip()]
+        err_status_by_iuid = {uid.strip(): status.strip() for status, uid in err_matches if uid.strip()}
+        return {
+            "__batch__": {
+                "rq_iuids": rq_iuids,
+                "ok_iuids": ok_iuids,
+                "err_iuids": err_iuids,
+                "err_status_by_iuid": err_status_by_iuid,
+            }
+        }
 
 
 class DcmtkDriver(ToolkitDriver):
@@ -488,11 +651,24 @@ class AnalyzeWorkflow:
             return (script_dir / p).resolve()
         return (script_dir / "runs").resolve()
 
+    def _with_toolkit_suffix(self, run_id: str) -> str:
+        suffix = toolkit_run_suffix(self.cfg.toolkit, self.cfg.dcm4che_send_mode)
+        raw = (run_id or "").strip()
+        if not raw:
+            return raw
+        base = strip_known_run_suffixes(raw)
+        if base != raw:
+            self._log(f"[RUN_ID_GUARD] run_id_normalized from={raw} to={base}_{suffix}")
+        if base.lower().endswith(f"_{suffix}"):
+            return base
+        return f"{base}_{suffix}"
+
     def run_analysis(self, exam_root: str, batch_size: int, run_id: str = "") -> dict:
         script_dir = Path(__file__).resolve().parent
         runs_base = self._resolve_runs_base(script_dir)
         runs_base.mkdir(parents=True, exist_ok=True)
         run = run_id.strip() or now_run_id()
+        run = self._with_toolkit_suffix(run)
         run_dir = runs_base / run
         run_dir.mkdir(parents=True, exist_ok=True)
         self._log("[RUN_LAYOUT] mode=analysis layout=core|telemetry|reports")
@@ -515,9 +691,15 @@ class AnalyzeWorkflow:
         allowed_ext = parse_extensions(self.cfg.allowed_extensions_csv)
         include_no_ext = bool(self.cfg.include_no_extension)
         restrict_extensions = bool(self.cfg.restrict_extensions)
+        dcm4che_send_mode = normalize_dcm4che_send_mode(self.cfg.dcm4che_send_mode)
+        force_all_files_for_folders = self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS"
+        if force_all_files_for_folders:
+            restrict_extensions = False
         self._log(f"RUN_ID analise: {run}")
         self._log("Iniciando descoberta de arquivos...")
-        if restrict_extensions:
+        if force_all_files_for_folders:
+            self._log("[AN_FILTER_MODE] mode=all_files reason=dcm4che_folders include_no_extension=IGNORED")
+        elif restrict_extensions:
             ext_text = ",".join(sorted(allowed_ext)) if allowed_ext else "<nenhuma_extensao>"
             self._log(
                 f"[AN_FILTER_MODE] mode=extensions allowed={ext_text} "
@@ -601,13 +783,12 @@ class AnalyzeWorkflow:
                                 continue
 
                             seq += 1
-                            if self.cfg.collect_size_bytes:
-                                try:
-                                    size = entry.stat(follow_symlinks=False).st_size
-                                except Exception:
-                                    size = 0
-                            else:
-                                size = 0
+                            try:
+                                size_actual = entry.stat(follow_symlinks=False).st_size
+                            except Exception:
+                                size_actual = 0
+                            # Always keep aggregate totals meaningful, even when per-file size collection is disabled.
+                            size = size_actual if self.cfg.collect_size_bytes else 0
 
                             ext = Path(entry.name).suffix.lower()
                             no_ext = ext == ""
@@ -623,16 +804,16 @@ class AnalyzeWorkflow:
                                 reason = "INCLUDED_ALL_FILES"
                             if include:
                                 selected_files += 1
-                                selected_bytes += size
+                                selected_bytes += size_actual
                                 selected_folder_keys.add(folder_key)
                             else:
                                 excluded_files += 1
 
                             total_files += 1
-                            total_bytes += size
+                            total_bytes += size_actual
                             agg = folder_agg.setdefault(folder_key, {"count": 0, "bytes": 0})
                             agg["count"] += 1
-                            agg["bytes"] += size
+                            agg["bytes"] += size_actual
 
                             ts_br, ts_iso = now_dual_timestamp()
                             row_buffer.append(
@@ -695,9 +876,11 @@ class AnalyzeWorkflow:
                 folder_fields,
             )
 
-        chunk_unit = "pastas" if self.cfg.toolkit == "dcm4che" else "arquivos"
+        dcm4che_send_mode = normalize_dcm4che_send_mode(self.cfg.dcm4che_send_mode)
+        use_folder_unit = self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS"
+        chunk_unit = "pastas" if use_folder_unit else "arquivos"
         selected_folder_count = len(selected_folder_keys)
-        chunk_base_count = selected_folder_count if self.cfg.toolkit == "dcm4che" else selected_files
+        chunk_base_count = selected_folder_count if use_folder_unit else selected_files
         chunk_total = math.ceil(chunk_base_count / batch_size) if chunk_base_count else 0
         summary_fields = [
             "run_id",
@@ -825,6 +1008,11 @@ class SendWorkflow:
             ts_mode = "AUTO"
         if self.cfg.toolkit == "dcm4che" and not self.cfg.dcm4che_use_shell_wrapper:
             self._log("[WARN] dcm4che sem wrapper de shell ativo (modo experimental).")
+        dcm4che_send_mode = normalize_dcm4che_send_mode(self.cfg.dcm4che_send_mode)
+        self._log(
+            f"[SEND_CONFIG] toolkit={self.cfg.toolkit} "
+            f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
+        )
         self._log("[RUN_LAYOUT] mode=send layout=core|telemetry|reports")
 
         manifest_files = resolve_run_artifact_path(run_dir, "manifest_files.csv", for_write=False, logger=self._log)
@@ -841,7 +1029,8 @@ class SendWorkflow:
             folder = str(r.get("folder_path", "")).strip() or str(Path(r["file_path"]).parent)
             folder_to_files.setdefault(folder, []).append(Path(r["file_path"]))
 
-        checkpoint_read = resolve_run_artifact_path(run_dir, "send_checkpoint.json", for_write=False, logger=self._log)
+        checkpoint_name = send_checkpoint_filename(self.cfg)
+        checkpoint_read = resolve_run_artifact_path(run_dir, checkpoint_name, for_write=False, logger=self._log)
 
         done_units = 0
         done_files = 0
@@ -858,7 +1047,6 @@ class SendWorkflow:
             for filename in [
                 "storescu_execucao.log",
                 "send_results_by_file.csv",
-                "file_iuid_map.csv",
                 "send_summary.csv",
             ]:
                 cleanup_run_artifact_variants(run_dir, filename)
@@ -869,12 +1057,11 @@ class SendWorkflow:
         log_file = resolve_run_artifact_path(run_dir, "storescu_execucao.log", for_write=True, logger=self._log)
         events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
         send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
-        file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=True, logger=self._log)
         send_summary = resolve_run_artifact_path(run_dir, "send_summary.csv", for_write=True, logger=self._log)
-        checkpoint = resolve_run_artifact_path(run_dir, "send_checkpoint.json", for_write=True, logger=self._log)
+        checkpoint = resolve_run_artifact_path(run_dir, checkpoint_name, for_write=True, logger=self._log)
         args_dir = resolve_run_batch_args_dir(run_dir, for_write=True, logger=self._log)
 
-        if self.cfg.toolkit == "dcm4che":
+        if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
             manifest_folders = resolve_run_artifact_path(run_dir, "manifest_folders.csv", for_write=False, logger=self._log)
             folder_keys = set(folder_to_files.keys())
             ordered_folders: list[str] = []
@@ -920,16 +1107,19 @@ class SendWorkflow:
             "sop_instance_uid",
             "source_ts_uid",
             "source_ts_name",
+            "extract_status",
             "processed_at",
         ]
-        map_fields = ["run_id", "file_path", "sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status", "mapped_at"]
 
         write_telemetry_event(
             events,
             run,
             "RUN_SEND_START",
             "Envio iniciado.",
-            f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit}",
+            (
+                f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit};"
+                f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
+            ),
         )
 
         sent_ok = 0
@@ -943,7 +1133,7 @@ class SendWorkflow:
             if self.cancel_event.is_set():
                 interrupted = True
                 break
-            if self.cfg.toolkit == "dcm4che":
+            if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
                 batch_inputs = [Path(x) for x in batch]
                 batch_files: list[Path] = []
                 for folder in batch:
@@ -1003,28 +1193,114 @@ class SendWorkflow:
             if interrupted:
                 break
 
+            parse_exception_by_file: dict[str, list[str]] = {}
+            current_scan_file = ""
+            for ln in lines:
+                m_scan = re.search(r"Failed to scan file (.+?):\s*(.+)$", ln)
+                if m_scan:
+                    current_scan_file = m_scan.group(1).strip()
+                    reason = m_scan.group(2).strip()
+                    parse_exception_by_file.setdefault(current_scan_file, []).append(reason)
+                    continue
+                if current_scan_file and (
+                    "DicomStreamException" in ln
+                    or "IllegalArgumentException" in ln
+                    or "EOFException" in ln
+                    or "Unrecognized VR code" in ln
+                ):
+                    parse_exception_by_file.setdefault(current_scan_file, []).append(ln.strip())
+
             parsed = self.driver.parse_send_output(lines, batch_inputs)
             if self.cfg.toolkit == "dcm4che":
                 batch_info = parsed.get("__batch__", {})
+                rq_iuid_list = [sanitize_uid(x) for x in batch_info.get("rq_iuids", []) if sanitize_uid(x)]
+                rq_iuid_set = set(rq_iuid_list)
                 ok_iuids = list(batch_info.get("ok_iuids", []))
                 err_iuids = list(batch_info.get("err_iuids", []))
-                ok_idx = 0
+                ok_iuid_set = set(ok_iuids)
+                err_iuid_set = set(err_iuids)
+                err_status_by_iuid = dict(batch_info.get("err_status_by_iuid", {}))
+
+                # Deterministic fallback: align request IUID sequence with likely DICOM payload files.
+                inferred_iuid_by_file: dict[str, str] = {}
+                rq_cursor = 0
+                for candidate in batch_files:
+                    cfp = str(candidate)
+                    if not looks_like_dicom_payload_file(candidate):
+                        continue
+                    if rq_cursor >= len(rq_iuid_list):
+                        break
+                    inferred_iuid_by_file[cfp] = rq_iuid_list[rq_cursor]
+                    rq_cursor += 1
+
                 for file_path in batch_files:
                     fp = str(file_path)
                     item_cursor += 1
-                    iuid = ""
-                    if ok_idx < len(ok_iuids):
-                        iuid = ok_iuids[ok_idx]
-                        ok_idx += 1
-                    if iuid:
+                    src_iuid = ""
+                    src_ts_uid = ""
+                    src_ts_name = ""
+                    extract_status = ""
+                    meta_err = ""
+                    try:
+                        src_iuid, src_ts_uid, src_ts_name, meta_err = self.driver.extract_metadata(self.cfg, file_path)
+                    except Exception as ex:
+                        meta_err = str(ex)
+                    src_iuid = sanitize_uid(src_iuid)
+                    src_ts_uid = sanitize_uid(src_ts_uid)
+                    src_ts_name = sanitize_uid(src_ts_name)
+
+                    # Fallback: many datasets already embed SOPInstanceUID in filename.
+                    if not src_iuid:
+                        src_iuid = sanitize_uid(Path(fp).name)
+                    inferred_iuid = inferred_iuid_by_file.get(fp, "")
+                    if (
+                        inferred_iuid
+                        and (
+                            (not src_iuid)
+                            or (src_iuid not in ok_iuid_set and src_iuid not in err_iuid_set and src_iuid not in rq_iuid_set)
+                        )
+                    ):
+                        if src_iuid and src_iuid != inferred_iuid:
+                            src_iuid_prev = src_iuid
+                            src_iuid = inferred_iuid
+                        else:
+                            src_iuid_prev = ""
+                            src_iuid = inferred_iuid
+                        uid_was_inferred = True
+                    else:
+                        src_iuid_prev = ""
+                        uid_was_inferred = False
+
+                    detail = (
+                        f"dcm4che parse: rq_iuids={len(rq_iuid_set)};ok_iuids={len(ok_iuids)};"
+                        f"err_iuids={len(err_iuids)};exit_code={exit_code}"
+                    )
+                    if meta_err:
+                        detail += f";meta_err={meta_err}"
+                    if src_iuid_prev:
+                        detail += f";uid_override={src_iuid_prev}->{src_iuid}"
+                    elif uid_was_inferred:
+                        detail += ";uid_inferred=RQ_ORDER"
+                    if not src_iuid:
+                        detail += ";uid_extract=EMPTY"
+
+                    if src_iuid and src_iuid in ok_iuid_set:
                         status = "SENT_OK"
+                        extract_status = "OK_FROM_STORESCU"
+                    elif src_iuid and src_iuid in err_iuid_set:
+                        status = "SEND_FAIL"
+                        detail += f";rsp_status={err_status_by_iuid.get(src_iuid, 'UNKNOWN')}"
+                        extract_status = "ERR_FROM_STORESCU"
+                    elif src_iuid and src_iuid in rq_iuid_set:
+                        # Request sent but no explicit success/error response in parsed output.
+                        status = "SENT_UNKNOWN"
+                        extract_status = "REQUESTED_NO_RSP"
                     elif exit_code != 0:
                         status = "SEND_FAIL"
+                        extract_status = "PROCESS_EXIT_FAIL"
                     else:
                         status = "SENT_UNKNOWN"
-                    detail = f"dcm4che parse: ok_iuids={len(ok_iuids)};err_iuids={len(err_iuids)};exit_code={exit_code}"
-                    ts_uid = ""
-                    ts_name = ""
+                        extract_status = "NO_MATCH"
 
                     if status == "SENT_OK":
                         sent_ok += 1
@@ -1043,9 +1319,10 @@ class SendWorkflow:
                             "ts_mode": ts_mode,
                             "send_status": status,
                             "status_detail": detail,
-                            "sop_instance_uid": iuid,
-                            "source_ts_uid": ts_uid,
-                            "source_ts_name": ts_name,
+                            "sop_instance_uid": src_iuid,
+                            "source_ts_uid": src_ts_uid,
+                            "source_ts_name": src_ts_name,
+                            "extract_status": extract_status,
                             "processed_at": now_br(),
                         },
                         result_fields,
@@ -1058,19 +1335,24 @@ class SendWorkflow:
                             detail or status,
                             f"chunk_no={chunk_index};file_path={fp};error_type={status}",
                         )
-                    if iuid:
-                        write_csv_row(
-                            file_iuid_map,
-                            {
-                                "run_id": run,
-                                "file_path": fp,
-                                "sop_instance_uid": iuid,
-                                "source_ts_uid": ts_uid,
-                                "source_ts_name": ts_name,
-                                "extract_status": "OK_FROM_STORESCU",
-                                "mapped_at": now_br(),
-                            },
-                            map_fields,
+                    if src_iuid and (status in ["SENT_UNKNOWN", "SEND_FAIL"]) and (src_iuid not in ok_iuid_set):
+                        self._log(
+                            f"[SEND_PARSE_MISMATCH] file={fp} iuid={src_iuid} "
+                            f"mode={dcm4che_send_mode} status={status} extract_status={extract_status}"
+                        )
+                    elif not src_iuid:
+                        self._log(
+                            f"[SEND_PARSE_UID_EMPTY] file={fp} mode={dcm4che_send_mode} "
+                            f"status={status} extract_status={extract_status}"
+                        )
+                    parse_notes = parse_exception_by_file.get(fp, [])
+                    if parse_notes:
+                        write_telemetry_event(
+                            events,
+                            run,
+                            "SEND_PARSE_EXCEPTION",
+                            parse_notes[0],
+                            f"chunk_no={chunk_index};file_path={fp};errors={len(parse_notes)}",
                         )
                     self.progress_callback(item_cursor, total_items, chunk_index, total_chunks)
             else:
@@ -1083,11 +1365,16 @@ class SendWorkflow:
                     iuid = ""
                     ts_uid = ""
                     ts_name = ""
+                    extract_status = ""
 
                     miuid, mts_uid, mts_name, m_err = self.driver.extract_metadata(self.cfg, file_path)
                     iuid = miuid
                     ts_uid = mts_uid
                     ts_name = mts_name
+                    if iuid:
+                        extract_status = "OK"
+                    elif status == "SENT_OK":
+                        extract_status = "MISSING_IUID"
                     if m_err and status == "SENT_OK":
                         detail = (detail + " | " + m_err).strip(" |")
 
@@ -1111,6 +1398,7 @@ class SendWorkflow:
                             "sop_instance_uid": iuid,
                             "source_ts_uid": ts_uid,
                             "source_ts_name": ts_name,
+                            "extract_status": extract_status,
                             "processed_at": now_br(),
                         },
                         result_fields,
@@ -1122,20 +1410,6 @@ class SendWorkflow:
                             "SEND_FILE_ERROR",
                             detail or status,
                             f"chunk_no={chunk_index};file_path={fp};error_type={status}",
-                        )
-                    if iuid:
-                        write_csv_row(
-                            file_iuid_map,
-                            {
-                                "run_id": run,
-                                "file_path": fp,
-                                "sop_instance_uid": iuid,
-                                "source_ts_uid": ts_uid,
-                                "source_ts_name": ts_name,
-                                "extract_status": "OK",
-                                "mapped_at": now_br(),
-                            },
-                            map_fields,
                         )
                     self.progress_callback(item_cursor, total_items, chunk_index, total_chunks)
             unit_cursor += len(batch_inputs)
@@ -1244,6 +1518,7 @@ class ValidationWorkflow:
     def _report_fields_from_dataset(self, dataset: dict) -> dict:
         return {
             "nome_paciente": self._dicom_text(dataset, "00100010"),
+            "data_nascimento": self._dicom_text(dataset, "00100030"),
             "prontuario": self._dicom_text(dataset, "00100020"),
             "accession_number": self._dicom_text(dataset, "00080050"),
             "sexo": self._dicom_text(dataset, "00100040"),
@@ -1266,50 +1541,49 @@ class ValidationWorkflow:
             raise RuntimeError(f"Run nao encontrado: {run_dir}")
         self._log("[RUN_LAYOUT] mode=report_export layout=core|telemetry|reports")
 
-        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=False, logger=self._log)
-        file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=True, logger=self._log)
+        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
+        legacy_file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=False, logger=self._log)
         if not send_results.exists():
             raise RuntimeError(f"Arquivo nao encontrado: {send_results}")
 
         send_rows = read_csv_rows(send_results)
-        map_rows = read_csv_rows(file_iuid_map)
-        map_by_file: dict[str, str] = {}
-        for r in map_rows:
-            fp = r.get("file_path", "").strip()
-            iu = r.get("sop_instance_uid", "").strip()
-            if fp and iu:
-                map_by_file[fp] = iu
+        map_by_file = build_iuid_map_from_send_rows(send_rows)
+        merge_iuid_map_from_legacy_file(map_by_file, legacy_file_iuid_map)
 
         sent_ok_rows = [r for r in send_rows if r.get("send_status", "") == "SENT_OK"]
         if not sent_ok_rows:
             raise RuntimeError("Nenhum arquivo SENT_OK encontrado para exportacao.")
 
         report_records: list[dict] = []
+        updates_by_file: dict[str, dict] = {}
         for row in sent_ok_rows:
             fp = row.get("file_path", "").strip()
             if not fp:
                 continue
-            iuid = map_by_file.get(fp, "").strip()
+            meta = map_by_file.get(fp, {})
+            iuid = str(meta.get("sop_instance_uid", "")).strip()
             if not iuid:
                 iuid, ts_uid, ts_name, err = self.driver.extract_metadata(self.cfg, Path(fp))
                 if iuid:
-                    map_by_file[fp] = iuid
-                    write_csv_row(
-                        file_iuid_map,
-                        {
-                            "run_id": run,
-                            "file_path": fp,
-                            "sop_instance_uid": iuid,
-                            "source_ts_uid": ts_uid,
-                            "source_ts_name": ts_name,
-                            "extract_status": "REPORT_EXPORT_OK",
-                            "mapped_at": now_br(),
-                        },
-                        ["run_id", "file_path", "sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status", "mapped_at"],
-                    )
+                    map_by_file[fp] = {
+                        "sop_instance_uid": iuid,
+                        "source_ts_uid": ts_uid,
+                        "source_ts_name": ts_name,
+                        "extract_status": "REPORT_EXPORT_OK",
+                    }
+                    updates_by_file[fp] = {
+                        "sop_instance_uid": iuid,
+                        "source_ts_uid": ts_uid,
+                        "source_ts_name": ts_name,
+                        "extract_status": "REPORT_EXPORT_OK",
+                    }
                 else:
                     self._log(f"[WARN] IUID ausente para arquivo no relatorio: {fp} | erro={err or 'desconhecido'}")
             report_records.append({"file_path": fp, "sop_instance_uid": iuid})
+
+        updated_rows = apply_send_result_updates(send_results, run, updates_by_file)
+        if updated_rows > 0:
+            self._log(f"[CORE_COMPACT] send_results_by_file atualizado com IUID para {updated_rows} arquivo(s).")
 
         unique_iuids = sorted({r["sop_instance_uid"] for r in report_records if r["sop_instance_uid"]})
         self._log(f"[REPORT_EXPORT] Modo {mode} | IUIDs unicos para consulta: {len(unique_iuids)}")
@@ -1340,6 +1614,7 @@ class ValidationWorkflow:
                 iuid,
                 {
                     "nome_paciente": "",
+                    "data_nascimento": "",
                     "prontuario": "",
                     "accession_number": "",
                     "sexo": "",
@@ -1357,6 +1632,7 @@ class ValidationWorkflow:
                     "file_path": fp,
                     "sop_instance_uid": iuid,
                     "nome_paciente": base.get("nome_paciente", ""),
+                    "data_nascimento": base.get("data_nascimento", ""),
                     "prontuario": base.get("prontuario", ""),
                     "accession_number": base.get("accession_number", ""),
                     "sexo": base.get("sexo", ""),
@@ -1376,6 +1652,7 @@ class ValidationWorkflow:
                 "file_path",
                 "sop_instance_uid",
                 "nome_paciente",
+                "data_nascimento",
                 "prontuario",
                 "accession_number",
                 "sexo",
@@ -1400,6 +1677,7 @@ class ValidationWorkflow:
                     "run_id": run,
                     "study_uid": study_uid,
                     "nome_paciente": "",
+                    "data_nascimento": "",
                     "prontuario": "",
                     "accession_number": "",
                     "sexo": "",
@@ -1410,7 +1688,7 @@ class ValidationWorkflow:
                 },
             )
             agg["total_arquivos"] = int(agg.get("total_arquivos", 0)) + 1
-            for f in ["nome_paciente", "prontuario", "accession_number", "sexo", "data_exame", "descricao_exame"]:
+            for f in ["nome_paciente", "data_nascimento", "prontuario", "accession_number", "sexo", "data_exame", "descricao_exame"]:
                 if not agg.get(f):
                     agg[f] = row.get(f, "")
             if not agg.get("study_uid"):
@@ -1426,6 +1704,7 @@ class ValidationWorkflow:
             "run_id",
             "study_uid",
             "nome_paciente",
+            "data_nascimento",
             "prontuario",
             "accession_number",
             "sexo",
@@ -1450,23 +1729,17 @@ class ValidationWorkflow:
             raise RuntimeError(f"Run nao encontrado: {run_dir}")
         self._log("[RUN_LAYOUT] mode=validation layout=core|telemetry|reports")
 
-        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=False, logger=self._log)
-        file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=True, logger=self._log)
-        for filename in ["validation_by_iuid.csv", "validation_by_file.csv", "reconciliation_report.csv"]:
+        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
+        legacy_file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=False, logger=self._log)
+        for filename in ["validation_results.csv", "validation_by_iuid.csv", "validation_by_file.csv", "reconciliation_report.csv"]:
             cleanup_run_artifact_variants(run_dir, filename)
         events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
-        val_iuid = resolve_run_artifact_path(run_dir, "validation_by_iuid.csv", for_write=True, logger=self._log)
-        val_file = resolve_run_artifact_path(run_dir, "validation_by_file.csv", for_write=True, logger=self._log)
+        validation_results = resolve_run_artifact_path(run_dir, "validation_results.csv", for_write=True, logger=self._log)
         recon = resolve_run_artifact_path(run_dir, "reconciliation_report.csv", for_write=True, logger=self._log)
 
         send_rows = read_csv_rows(send_results)
-        map_rows = read_csv_rows(file_iuid_map)
-        map_by_file: dict[str, str] = {}
-        for r in map_rows:
-            fp = r.get("file_path", "").strip()
-            iu = r.get("sop_instance_uid", "").strip()
-            if fp and iu:
-                map_by_file[fp] = iu
+        map_by_file = build_iuid_map_from_send_rows(send_rows)
+        merge_iuid_map_from_legacy_file(map_by_file, legacy_file_iuid_map)
 
         total_send_rows = len(send_rows)
         send_ok_files = sum(1 for r in send_rows if r.get("send_status", "") == "SENT_OK")
@@ -1477,9 +1750,19 @@ class ValidationWorkflow:
             f"Resumo send para validacao: total={total_send_rows} sent_ok={send_ok_files} "
             f"warn={send_warn_files} fail={send_fail_files}"
         )
-        self._log(f"Mapeamentos IUID atuais: {len(map_by_file)}")
+        self._log(f"Mapeamentos IUID atuais (send_results+fallback legado): {len(map_by_file)}")
+        write_telemetry_event(
+            events,
+            run,
+            "VALIDATION_START",
+            "Validacao iniciada.",
+            (
+                f"send_rows={total_send_rows};sent_ok={send_ok_files};send_warn={send_warn_files};"
+                f"send_fail={send_fail_files};mapped_iuid={len(map_by_file)}"
+            ),
+        )
 
-        map_fields = ["run_id", "file_path", "sop_instance_uid", "source_ts_uid", "source_ts_name", "extract_status", "mapped_at"]
+        updates_by_file: dict[str, dict] = {}
         # consistency check: complete missing IUIDs before API calls
         for row in send_rows:
             if row.get("send_status", "") != "SENT_OK":
@@ -1489,20 +1772,18 @@ class ValidationWorkflow:
                 continue
             iuid, ts_uid, ts_name, err = self.driver.extract_metadata(self.cfg, Path(fp))
             if iuid:
-                map_by_file[fp] = iuid
-                write_csv_row(
-                    file_iuid_map,
-                    {
-                        "run_id": run,
-                        "file_path": fp,
-                        "sop_instance_uid": iuid,
-                        "source_ts_uid": ts_uid,
-                        "source_ts_name": ts_name,
-                        "extract_status": "CONSISTENCY_OK",
-                        "mapped_at": now_br(),
-                    },
-                    map_fields,
-                )
+                map_by_file[fp] = {
+                    "sop_instance_uid": iuid,
+                    "source_ts_uid": ts_uid,
+                    "source_ts_name": ts_name,
+                    "extract_status": "CONSISTENCY_OK",
+                }
+                updates_by_file[fp] = {
+                    "sop_instance_uid": iuid,
+                    "source_ts_uid": ts_uid,
+                    "source_ts_name": ts_name,
+                    "extract_status": "CONSISTENCY_OK",
+                }
                 write_telemetry_event(
                     events,
                     run,
@@ -1519,20 +1800,33 @@ class ValidationWorkflow:
                     f"file_path={fp}",
                 )
 
+        updated_rows = apply_send_result_updates(send_results, run, updates_by_file)
+        if updated_rows > 0:
+            self._log(f"[CORE_COMPACT] send_results_by_file atualizado pela consistencia em {updated_rows} arquivo(s).")
+
         iuid_to_files: dict[str, list[str]] = {}
         for row in send_rows:
             if row.get("send_status", "") != "SENT_OK":
                 continue
             fp = row.get("file_path", "").strip()
-            iuid = map_by_file.get(fp, "").strip()
+            iuid = str(map_by_file.get(fp, {}).get("sop_instance_uid", "")).strip()
             if not iuid:
                 continue
             iuid_to_files.setdefault(iuid, []).append(fp)
 
         self._log(f"IUIDs unicos para consulta API: {len(iuid_to_files)}")
 
-        iuid_fields = ["run_id", "sop_instance_uid", "api_found", "http_status", "detail", "checked_at"]
-        file_fields = ["run_id", "file_path", "sop_instance_uid", "send_status", "validation_status", "checked_at"]
+        validation_fields = [
+            "run_id",
+            "file_path",
+            "sop_instance_uid",
+            "send_status",
+            "validation_status",
+            "api_found",
+            "http_status",
+            "detail",
+            "checked_at",
+        ]
 
         ok_count = 0
         miss_count = 0
@@ -1566,31 +1860,22 @@ class ValidationWorkflow:
                 else:
                     miss_count += 1
 
-            write_csv_row(
-                val_iuid,
-                {
-                    "run_id": run,
-                    "sop_instance_uid": iuid,
-                    "api_found": api_found,
-                    "http_status": http_status,
-                    "detail": detail,
-                    "checked_at": now_br(),
-                },
-                iuid_fields,
-            )
             status = "OK" if api_found == 1 else ("API_ERROR" if http_status in ["ERR", ""] else "NOT_FOUND")
             for fp in files:
                 write_csv_row(
-                    val_file,
+                    validation_results,
                     {
                         "run_id": run,
                         "file_path": fp,
                         "sop_instance_uid": iuid,
                         "send_status": "SENT_OK",
                         "validation_status": status,
+                        "api_found": api_found,
+                        "http_status": http_status,
+                        "detail": detail,
                         "checked_at": now_br(),
                     },
-                    file_fields,
+                    validation_fields,
                 )
             if (ok_count + miss_count + api_err_count) % 100 == 0:
                 self._log(
@@ -1640,6 +1925,16 @@ class ValidationWorkflow:
         self._log(f"IUIDs NOT_FOUND: {miss_count}")
         self._log(f"IUIDs API_ERROR: {api_err_count}")
         self._log(f"Status final: {final_status}")
+        write_telemetry_event(
+            events,
+            run,
+            "VALIDATION_END",
+            "Validacao finalizada.",
+            (
+                f"status={final_status};iuid_total={len(iuid_to_files)};iuid_ok={ok_count};"
+                f"iuid_not_found={miss_count};iuid_api_error={api_err_count}"
+            ),
+        )
         return {"run_id": run, "status": final_status, "run_dir": str(run_dir)}
 
 
@@ -1663,46 +1958,64 @@ class ConfigDialog(tk.Toplevel):
         self.var_no_ext = tk.BooleanVar(value=bool(config.include_no_extension))
         self.var_collect_size = tk.BooleanVar(value=bool(config.collect_size_bytes))
         self.var_ts = tk.StringVar(value=config.ts_mode)
+        self.var_dcm4che_send_mode = tk.StringVar(value=normalize_dcm4che_send_mode(config.dcm4che_send_mode))
 
         frm = ttk.Frame(self, padding=12)
         frm.grid(sticky="nsew")
         frm.columnconfigure(1, weight=1)
-        self._row_entry(frm, 0, "Toolkit", self.var_toolkit, combo_values=["dcm4che", "dcmtk"])
+        self.cmb_toolkit = self._row_entry(frm, 0, "Toolkit", self.var_toolkit, combo_values=["dcm4che", "dcmtk"])
+        if isinstance(self.cmb_toolkit, ttk.Combobox):
+            self.cmb_toolkit.bind("<<ComboboxSelected>>", lambda _e: self._toggle_dcm4che_controls())
         self._row_entry(frm, 1, "AET origem", self.var_aet_src)
         self._row_entry(frm, 2, "AET destino", self.var_aet_dst)
         self._row_entry(frm, 3, "PACS DICOM host (C-STORE)", self.var_host)
         self._row_entry(frm, 4, "PACS DICOM port (C-STORE)", self.var_port)
         self._row_entry(frm, 5, "PACS REST host:porta", self.var_rest)
         self._row_entry(frm, 6, "Batch default", self.var_batch)
+        self.lbl_dcm4che_mode = ttk.Label(frm, text="Modo de envio dcm4che")
+        self.lbl_dcm4che_mode.grid(row=7, column=0, sticky="w", pady=3)
+        self.cmb_dcm4che_mode = ttk.Combobox(
+            frm,
+            textvariable=self.var_dcm4che_send_mode,
+            values=["MANIFEST_FILES", "FOLDERS"],
+            width=56,
+            state="readonly",
+        )
+        self.cmb_dcm4che_mode.grid(row=7, column=1, sticky="we", pady=3)
+        if isinstance(self.cmb_dcm4che_mode, ttk.Combobox):
+            self.cmb_dcm4che_mode.bind("<<ComboboxSelected>>", lambda _e: self._toggle_extension_controls())
 
-        filter_frame = ttk.LabelFrame(frm, text="Filtro de arquivos para analise", padding=8)
-        filter_frame.grid(row=7, column=0, columnspan=2, sticky="we", pady=(6, 0))
-        filter_frame.columnconfigure(1, weight=1)
-        ttk.Checkbutton(
-            filter_frame,
+        self.filter_frame = ttk.LabelFrame(frm, text="Filtro de arquivos para analise", padding=8)
+        self.filter_frame.grid(row=8, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.filter_frame.columnconfigure(1, weight=1)
+        self.chk_include_all = ttk.Checkbutton(
+            self.filter_frame,
             text="Nao restringir por extensao (incluir todos os arquivos)",
             variable=self.var_include_all_files,
             command=self._toggle_extension_controls,
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        )
+        self.chk_include_all.grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
-            filter_frame,
+            self.filter_frame,
             text="Extensoes permitidas (separadas por virgula, ex: .dcm,.ima)",
         ).grid(row=1, column=0, sticky="w", pady=(6, 3))
-        self.entry_ext = ttk.Entry(filter_frame, textvariable=self.var_ext, width=58)
+        self.entry_ext = ttk.Entry(self.filter_frame, textvariable=self.var_ext, width=58)
         self.entry_ext.grid(row=1, column=1, sticky="we", pady=(6, 3))
-        self.chk_no_ext = ttk.Checkbutton(filter_frame, text="Incluir arquivos sem extensao", variable=self.var_no_ext)
+        self.chk_no_ext = ttk.Checkbutton(self.filter_frame, text="Incluir arquivos sem extensao", variable=self.var_no_ext)
         self.chk_no_ext.grid(row=2, column=0, columnspan=2, sticky="w")
+        self.lbl_filter_mode_hint = ttk.Label(self.filter_frame, text="")
+        self.lbl_filter_mode_hint.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         ttk.Checkbutton(
             frm,
             text="Calcular size_bytes na analise (mais lento)",
             variable=self.var_collect_size,
-        ).grid(row=8, column=0, columnspan=2, sticky="w")
-        self._row_entry(frm, 9, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
-        self._toggle_extension_controls()
+        ).grid(row=9, column=0, columnspan=2, sticky="w")
+        self._row_entry(frm, 10, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
+        self._toggle_dcm4che_controls()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=10, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btns.grid(row=11, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btns, text="Testar Echo", command=self._test_echo).pack(side="left", padx=4)
         ttk.Button(btns, text="Salvar", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Fechar", command=self.destroy).pack(side="left", padx=4)
@@ -1724,9 +2037,33 @@ class ConfigDialog(tk.Toplevel):
             var.set(p)
 
     def _toggle_extension_controls(self):
+        if self._is_filter_block_disabled_by_mode():
+            self.chk_include_all.configure(state="disabled")
+            self.entry_ext.configure(state="disabled")
+            self.chk_no_ext.configure(state="disabled")
+            self.lbl_filter_mode_hint.configure(text="Modo dcm4che FOLDERS: filtro de arquivos inativo.")
+            return
+        self.chk_include_all.configure(state="normal")
         state = "disabled" if bool(self.var_include_all_files.get()) else "normal"
         self.entry_ext.configure(state=state)
         self.chk_no_ext.configure(state=state)
+        self.lbl_filter_mode_hint.configure(text="")
+
+    def _is_filter_block_disabled_by_mode(self) -> bool:
+        return (
+            self.var_toolkit.get().strip().lower() == "dcm4che"
+            and normalize_dcm4che_send_mode(self.var_dcm4che_send_mode.get().strip()) == "FOLDERS"
+        )
+
+    def _toggle_dcm4che_controls(self):
+        is_dcm4che = self.var_toolkit.get().strip().lower() == "dcm4che"
+        if is_dcm4che:
+            self.lbl_dcm4che_mode.grid()
+            self.cmb_dcm4che_mode.grid()
+        else:
+            self.lbl_dcm4che_mode.grid_remove()
+            self.cmb_dcm4che_mode.grid_remove()
+        self._toggle_extension_controls()
 
     def _build_config(self) -> AppConfig:
         return AppConfig(
@@ -1742,6 +2079,7 @@ class ConfigDialog(tk.Toplevel):
             include_no_extension=bool(self.var_no_ext.get()),
             collect_size_bytes=bool(self.var_collect_size.get()),
             ts_mode=self.var_ts.get().strip(),
+            dcm4che_send_mode=normalize_dcm4che_send_mode(self.var_dcm4che_send_mode.get().strip()),
         )
 
     def _test_echo(self):
@@ -1804,10 +2142,17 @@ class App(tk.Tk):
             cfg.aet_origem = "HMD_IMPORTER"
         # Keep runs local to the app by default; this setting is no longer exposed in UI.
         cfg.runs_base_dir = ""
+        cfg.dcm4che_send_mode = normalize_dcm4che_send_mode(cfg.dcm4che_send_mode)
         apply_internal_toolkit_paths(cfg, self.base_dir)
         return cfg
 
     def _save_config(self, cfg: AppConfig):
+        prev_toolkit = (self.config_obj.toolkit or "").strip().lower()
+        prev_mode = normalize_dcm4che_send_mode(self.config_obj.dcm4che_send_mode)
+        new_toolkit = (cfg.toolkit or "").strip().lower()
+        new_mode = normalize_dcm4che_send_mode(cfg.dcm4che_send_mode)
+        mode_changed = (prev_toolkit != new_toolkit) or (prev_toolkit == "dcm4che" and prev_mode != new_mode)
+
         self.config_obj = cfg
         self.config_file.write_text(json.dumps(asdict(cfg), ensure_ascii=True, indent=2), encoding="utf-8")
         self.var_batch_size.set(str(cfg.batch_size_default))
@@ -1816,9 +2161,22 @@ class App(tk.Tk):
             f"pacs_dicom={cfg.pacs_host}:{cfg.pacs_port} pacs_rest={cfg.pacs_rest_host} "
             f"batch={cfg.batch_size_default} restrict_extensions={'ON' if cfg.restrict_extensions else 'OFF'} "
             f"include_no_extension={'ON' if cfg.include_no_extension else 'OFF'} "
-            f"collect_size_bytes={'ON' if cfg.collect_size_bytes else 'OFF'}"
+            f"collect_size_bytes={'ON' if cfg.collect_size_bytes else 'OFF'} "
+            f"dcm4che_send_mode={cfg.dcm4che_send_mode}"
         )
         self._log_an("Configuracoes atualizadas.")
+        if mode_changed:
+            self.var_run_id.set("")
+            self._log_an(
+                "[RUN_ID_RESET] toolkit/modo alterado; Run ID (opcional) limpo para evitar sufixo incorreto."
+            )
+            messagebox.showinfo(
+                "Configuracao atualizada",
+                "Toolkit/modo de envio alterado.\n\n"
+                "O campo 'Run ID (opcional)' foi limpo para evitar sufixo incorreto. "
+                "Nao e necessario reiniciar o sistema.",
+                parent=self,
+            )
         self._refresh_run_list()
 
     def _build_menu(self):
@@ -1855,7 +2213,7 @@ class App(tk.Tk):
         ttk.Label(top, text="Pasta exames").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_exam_root, width=90).grid(row=0, column=1, sticky="we", padx=6)
         ttk.Button(top, text="...", width=3, command=self._browse_exam_root).grid(row=0, column=2)
-        ttk.Label(top, text="Batch size (dcm4che=pastas | dcmtk=arquivos)").grid(row=1, column=0, sticky="w")
+        ttk.Label(top, text="Batch size (dcm4che=folders/files conforme modo | dcmtk=arquivos)").grid(row=1, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_batch_size, width=12).grid(row=1, column=1, sticky="w", padx=6)
         ttk.Label(top, text="Run ID (opcional)").grid(row=2, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_run_id, width=28).grid(row=2, column=1, sticky="w", padx=6)
@@ -1877,6 +2235,7 @@ class App(tk.Tk):
         y = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_an.yview)
         y.pack(side="right", fill="y")
         self.txt_an.configure(yscrollcommand=y.set)
+        self._setup_log_tags(self.txt_an)
 
     def _build_send_tab(self):
         top = ttk.Frame(self.tab_send, padding=10)
@@ -1905,6 +2264,7 @@ class App(tk.Tk):
         y = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_send.yview)
         y.pack(side="right", fill="y")
         self.txt_send.configure(yscrollcommand=y.set)
+        self._setup_log_tags(self.txt_send)
 
     def _build_validation_tab(self):
         top = ttk.Frame(self.tab_val, padding=10)
@@ -1933,6 +2293,7 @@ class App(tk.Tk):
         y = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_val.yview)
         y.pack(side="right", fill="y")
         self.txt_val.configure(yscrollcommand=y.set)
+        self._setup_log_tags(self.txt_val)
 
     def _build_runs_tab(self):
         root = ttk.Frame(self.tab_runs, padding=10)
@@ -2123,17 +2484,57 @@ class App(tk.Tk):
         self._log_send("Cancelamento solicitado...")
         self._log_val("Cancelamento solicitado...")
 
+    def _setup_log_tags(self, widget: tk.Text) -> None:
+        # Visual-only highlighting in UI. Raw log files remain plain text.
+        widget.tag_configure("log_error", foreground="#b00020")
+        widget.tag_configure("log_warn", foreground="#9a6700")
+        widget.tag_configure("log_success", foreground="#1f883d")
+        widget.tag_configure("log_system", foreground="#1f6feb")
+
+    def _classify_log_tag(self, text: str) -> str:
+        line = (text or "").strip()
+        up = line.upper()
+        if not line:
+            return ""
+        if "[ERRO]" in up or "[ERROR]" in up or "TRACEBACK" in up or "EXCEPTION" in up or "RUNTIMEERROR" in up:
+            return "log_error"
+        if (
+            "[WARN" in up
+            or " WARN " in up
+            or "PASS_WITH_WARNINGS" in up
+            or "SEND_PARSE_" in up
+            or "SENT_UNKNOWN" in up
+        ):
+            return "log_warn"
+        if (
+            "STATUS: PASS" in up
+            or "STATUS FINAL: PASS" in up
+            or "VALIDACAO FINALIZADA" in up
+            or "SEND FINALIZADO" in up
+            or "ANALISE FINALIZADA" in up
+            or "[REPORT_EXPORT]" in up
+        ):
+            return "log_success"
+        if line.startswith("[") and "]" in line:
+            return "log_system"
+        return ""
+
+    def _append_log_line(self, widget: tk.Text, text: str) -> None:
+        tag = self._classify_log_tag(text)
+        if tag:
+            widget.insert("end", text + "\n", tag)
+        else:
+            widget.insert("end", text + "\n")
+        widget.see("end")
+
     def _log_an(self, text: str):
-        self.txt_an.insert("end", text + "\n")
-        self.txt_an.see("end")
+        self._append_log_line(self.txt_an, text)
 
     def _log_send(self, text: str):
-        self.txt_send.insert("end", text + "\n")
-        self.txt_send.see("end")
+        self._append_log_line(self.txt_send, text)
 
     def _log_val(self, text: str):
-        self.txt_val.insert("end", text + "\n")
-        self.txt_val.see("end")
+        self._append_log_line(self.txt_val, text)
 
     def _human_size(self, value: int) -> str:
         n = float(value)

@@ -18,6 +18,7 @@ Aplicacao desktop em Tkinter para fluxo DICOM com dois toolkits:
    - `manifest_folders.csv`
    - `manifest_files.csv`
    - `analysis_summary.csv`
+   - `run_id` automatico passa a incluir sufixo do toolkit/modo (ex.: `26022026_123000_dcm4che_folders`, `26022026_123500_dcm4che_files`, `26022026_124000_dcmtk`)
 2. Revisar dashboard de analise.
 3. Rodar `Send` por `run_id`.
 4. Rodar `Validacao` manualmente por `run_id`.
@@ -35,10 +36,9 @@ Cada `run_id` agora organiza os artefatos em subpastas:
   - `analysis_summary.csv`
   - `send_results_by_file.csv`
   - `send_summary.csv`
-  - `file_iuid_map.csv`
-  - `validation_by_iuid.csv`
-  - `validation_by_file.csv`
-  - `send_checkpoint.json`
+  - `validation_results.csv`
+  - `send_checkpoint_dcm4che_folders.json` ou `send_checkpoint_dcm4che_files.json` (quando toolkit = dcm4che)
+  - `send_checkpoint_dcmtk.json` (quando toolkit = dcmtk)
   - `batch_args/`
 - `telemetry/`
   - `events.csv` (telemetria consolidada do run)
@@ -49,6 +49,7 @@ Cada `run_id` agora organiza os artefatos em subpastas:
   - `validation_full_report_C.csv` (quando exportado no modo C)
 
 Compatibilidade: runs antigos sem subpastas continuam sendo lidos automaticamente (fallback para layout legado).
+Compatibilidade de schema: arquivos legados de `core` (`file_iuid_map.csv`, `validation_by_iuid.csv`, `validation_by_file.csv`) sao lidos como fallback quando presentes, mas novos runs passam a consolidar esses dados em `send_results_by_file.csv` e `validation_results.csv`.
 
 ## Telemetria consolidada por run
 
@@ -77,6 +78,8 @@ Exemplos práticos de leitura:
 - Envio:
   - `RUN_SEND_START`, `CHUNK_START`, `CHUNK_END`, `RUN_SEND_END`
   - Falha por item: `SEND_FILE_ERROR` (use `ref` para localizar `file_path` e `error_type`)
+  - Erros de parsing/scan no storescu: `SEND_PARSE_EXCEPTION`
+  - Marcadores de diagnostico no log: `[SEND_PARSE_MISMATCH]` e `[RUN_ID_GUARD]`
 - Consistência/validação: `CONSISTENCY_FILLED`, `CONSISTENCY_MISSING`
 - Execução sem trabalho novo: `RUN_SEND_SKIP_ALREADY_COMPLETED`
 
@@ -100,6 +103,7 @@ Import-Csv "python-multi\runs\$run\telemetry\events.csv" -Delimiter ";" |
 Campos principais exportados:
 
 - `nome_paciente`
+- `data_nascimento`
 - `prontuario`
 - `accession_number`
 - `sexo`
@@ -113,6 +117,7 @@ Campos principais exportados:
 No menu `Configuracao -> Configuracoes`:
 
 - Toolkit ativo (`dcm4che` ou `dcmtk`)
+- Modo de envio dcm4che (`MANIFEST_FILES` padrao, ou `FOLDERS`) quando toolkit = `dcm4che`
 - AET origem (padrao: `HMD_IMPORTER`), AET destino
 - PACS DICOM host (C-STORE) e PACS DICOM port (C-STORE)
 - Host REST para validacao
@@ -121,10 +126,12 @@ No menu `Configuracao -> Configuracoes`:
   - lista separada por virgula, ex.: `.dcm,.ima,.dicom`
   - opcao `Nao restringir por extensao (incluir todos os arquivos)` (desmarcada por padrao)
   - opcao `Incluir arquivos sem extensao` (aplicada quando a restricao por extensao estiver ativa)
+  - em `dcm4che + FOLDERS`, esse bloco fica inativo e a analise considera todos os arquivos para manter coerencia com o envio por pasta
 - Opcao de calcular `size_bytes` na analise (desmarcada por padrao para melhor performance)
 - Modo TS (`AUTO`, `JPEG_LS_LOSSLESS`, `UNCOMPRESSED_STANDARD`)
 
 Observacao: o campo `Runs base dir` nao e mais exibido na interface. O app usa o caminho local padrao `python-multi/runs`.
+Ao trocar toolkit/modo de envio, o app limpa automaticamente o campo `Run ID (opcional)` para evitar sufixo inconsistente; nao e necessario reiniciar.
 
 Observacao: nesta versao, apenas `AUTO` esta ativo. Os demais modos estao estruturados para evolucao futura.
 As toolkits sao sempre resolvidas internamente em `toolkits/<nome>-*/bin` relativo ao app (sem configuracao manual de path).
