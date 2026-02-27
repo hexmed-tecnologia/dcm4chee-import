@@ -1,0 +1,5 @@
+feat: tornar envio dcm4che robusto com JAVA_DIRECT e telemetria por chunk
+
+O envio dcm4che no Windows passa a priorizar execucao via Java direto com @argfile para reduzir risco de falhas por limite de linha de comando do cmd. Quando JAVA_DIRECT nao estiver disponivel, o fluxo entra em fallback CMD_BAT com guarda preventiva que calcula o tamanho real do comando por chunk e divide automaticamente em subchunks seguros antes da execucao.
+
+Tambem foi adicionada telemetria detalhada de comando por chunk, com logs explicitos do modo de execucao (JAVA_DIRECT ou CMD_BAT), eventos dedicados no events.csv e arquivo de trace com comando completo em telemetry/chunk_commands para depuracao posterior.

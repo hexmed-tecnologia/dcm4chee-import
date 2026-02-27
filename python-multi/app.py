@@ -4,6 +4,8 @@ import math
 import os
 import queue
 import re
+import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -41,6 +43,7 @@ UID_VALUE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)+")
 IS_WINDOWS = os.name == "nt"
 WINDOWS_CMD_SAFE_MAX_CHARS = 7600
 WINDOWS_DIRECT_SAFE_MAX_CHARS = 30000
+DCM4CHE_JAVA_MAIN_CLASS = "org.dcm4che3.tool.storescu.StoreSCU"
 
 
 def hidden_process_kwargs() -> dict:
@@ -72,6 +75,8 @@ class AppConfig:
     collect_size_bytes: bool = False
     ts_mode: str = "AUTO"
     dcm4che_send_mode: str = "MANIFEST_FILES"
+    # Prefer direct Java launcher with @argfile on Windows to avoid cmd line-length bottlenecks.
+    dcm4che_prefer_java_direct: bool = True
     # Internal flag: keep Windows-stable wrapper for .bat execution by default.
     dcm4che_use_shell_wrapper: bool = True
 
@@ -84,7 +89,61 @@ def _windows_cmdline_len(args: list[str]) -> int:
     return len(subprocess.list2cmdline([str(x) for x in args]))
 
 
+def _java_argfile_token(token: str) -> str:
+    # Java @argfile treats backslash as escape; keep Windows paths literal by doubling "\".
+    escaped = str(token).replace("\\", "\\\\").replace('"', '\\"')
+    return f"\"{escaped}\""
+
+
+def format_command_line(args: list[str]) -> str:
+    if IS_WINDOWS:
+        return subprocess.list2cmdline([str(x) for x in args])
+    return " ".join(shlex.quote(str(x)) for x in args)
+
+
+def command_line_len(args: list[str]) -> int:
+    if IS_WINDOWS:
+        return _windows_cmdline_len(args)
+    return len(format_command_line(args))
+
+
+def resolve_java_executable() -> tuple[str, str]:
+    candidates: list[str] = []
+    java_home = os.environ.get("JAVA_HOME", "").strip()
+    if java_home:
+        java_bin = Path(java_home) / "bin" / ("java.exe" if IS_WINDOWS else "java")
+        candidates.append(str(java_bin))
+    java_on_path = shutil.which("java")
+    if java_on_path:
+        candidates.append(java_on_path)
+
+    seen: set[str] = set()
+    last_reason = "java_not_found"
+    for candidate in candidates:
+        key = str(Path(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            proc = subprocess.run(
+                [candidate, "-version"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+                **hidden_process_kwargs(),
+            )
+            if proc.returncode == 0:
+                return candidate, "OK"
+            last_reason = f"java_version_exit={proc.returncode}"
+        except Exception as ex:
+            last_reason = str(ex)
+    return "", last_reason
+
+
 def estimate_dcm4che_batch_max_cmd(cfg: AppConfig, unit_max_arg_len: int, units_total: int) -> tuple[int, str, int]:
+    if IS_WINDOWS and cfg.dcm4che_prefer_java_direct:
+        return units_total, "DCM4CHE_JAVA_ARGFILE", WINDOWS_DIRECT_SAFE_MAX_CHARS
     source = "DCM4CHE_CMD_LIMIT"
     budget = WINDOWS_CMD_SAFE_MAX_CHARS if (IS_WINDOWS and cfg.dcm4che_use_shell_wrapper) else WINDOWS_DIRECT_SAFE_MAX_CHARS
     if units_total <= 0:
@@ -1075,6 +1134,102 @@ class SendWorkflow:
         except Exception:
             pass
 
+    def _dcm4che_storescu_bat_path(self) -> Path:
+        if not self.cfg.dcm4che_bin_path:
+            raise RuntimeError(
+                "storescu.bat nao encontrado na toolkit interna. "
+                "Estrutura esperada: <app>\\toolkits\\dcm4che-*\\bin\\storescu.bat"
+            )
+        storescu = Path(self.cfg.dcm4che_bin_path) / "storescu.bat"
+        if not storescu.exists():
+            raise RuntimeError(f"storescu.bat nao encontrado: {storescu}")
+        return storescu
+
+    def _dcm4che_cmd_budget(self) -> int:
+        return WINDOWS_CMD_SAFE_MAX_CHARS if (IS_WINDOWS and self.cfg.dcm4che_use_shell_wrapper) else WINDOWS_DIRECT_SAFE_MAX_CHARS
+
+    def _build_dcm4che_cmd_bat(self, batch_inputs: list[Path]) -> list[str]:
+        storescu = self._dcm4che_storescu_bat_path()
+        base = [
+            str(storescu),
+            "-c",
+            f"{self.cfg.aet_destino}@{self.cfg.pacs_host}:{self.cfg.pacs_port}",
+        ]
+        base.extend([str(p) for p in batch_inputs])
+        if self.cfg.dcm4che_use_shell_wrapper:
+            return ["cmd", "/c", *base]
+        return base
+
+    def _split_dcm4che_inputs_by_cmd_limit(self, batch_inputs: list[Path]) -> tuple[list[list[Path]], int, int]:
+        budget = self._dcm4che_cmd_budget()
+        split_batches: list[list[Path]] = []
+        current: list[Path] = []
+        max_cmdline_len = 0
+        for unit in batch_inputs:
+            trial = current + [unit]
+            trial_len = command_line_len(self._build_dcm4che_cmd_bat(trial))
+            max_cmdline_len = max(max_cmdline_len, trial_len)
+            if current and trial_len > budget:
+                split_batches.append(current)
+                current = [unit]
+                single_len = command_line_len(self._build_dcm4che_cmd_bat(current))
+                max_cmdline_len = max(max_cmdline_len, single_len)
+            else:
+                current = trial
+        if current:
+            split_batches.append(current)
+        return split_batches, budget, max_cmdline_len
+
+    def _build_dcm4che_java_cmd(self, java_exec: str, batch_inputs: list[Path], args_file: Path) -> tuple[list[str], Path]:
+        if not java_exec:
+            raise RuntimeError("java nao encontrado para modo dcm4che JAVA_DIRECT.")
+        storescu = self._dcm4che_storescu_bat_path()
+        dcm4che_root = storescu.parent.parent
+        classpath = dcm4che_root / "lib" / "*"
+        java_args_file = args_file.with_suffix(".javaargs")
+        tokens = [
+            "-cp",
+            str(classpath),
+            DCM4CHE_JAVA_MAIN_CLASS,
+            "-c",
+            f"{self.cfg.aet_destino}@{self.cfg.pacs_host}:{self.cfg.pacs_port}",
+            *[str(p) for p in batch_inputs],
+        ]
+        with java_args_file.open("w", encoding="utf-8") as f:
+            for token in tokens:
+                f.write(f"{_java_argfile_token(token)}\n")
+        return [java_exec, f"@{java_args_file}"], java_args_file
+
+    def _write_chunk_command_trace(
+        self,
+        *,
+        trace_file: Path,
+        chunk_index: int,
+        total_chunks: int,
+        cmd_mode: str,
+        cmd: list[str],
+        cmdline_len: int,
+        budget: int,
+        args_file: Path,
+        java_args_file: Path | None,
+    ) -> None:
+        trace_file.parent.mkdir(parents=True, exist_ok=True)
+        cmdline = format_command_line(cmd)
+        with trace_file.open("w", encoding="utf-8") as f:
+            f.write(f"chunk={chunk_index}/{total_chunks}\n")
+            f.write(f"mode={cmd_mode}\n")
+            f.write(f"cmdline_len={cmdline_len}\n")
+            f.write(f"budget={budget}\n")
+            f.write(f"batch_args_file={args_file}\n")
+            if java_args_file is not None:
+                f.write(f"java_args_file={java_args_file}\n")
+            f.write("\n[command]\n")
+            f.write(cmdline)
+            f.write("\n")
+            if java_args_file is not None and java_args_file.exists():
+                f.write("\n[java_args_file_content]\n")
+                f.write(java_args_file.read_text(encoding="utf-8", errors="replace"))
+
     def run_send(self, run_id: str, batch_size: int, show_output: bool = True) -> dict:
         send_start_ts = time.monotonic()
         script_dir = Path(__file__).resolve().parent
@@ -1092,12 +1247,29 @@ class SendWorkflow:
         if ts_mode != "AUTO":
             self._log(f"[WARN] TS mode '{ts_mode}' ainda nao implementado. Usando AUTO.")
             ts_mode = "AUTO"
-        if self.cfg.toolkit == "dcm4che" and not self.cfg.dcm4che_use_shell_wrapper:
-            self._log("[WARN] dcm4che sem wrapper de shell ativo (modo experimental).")
         dcm4che_send_mode = normalize_dcm4che_send_mode(self.cfg.dcm4che_send_mode)
+        dcm4che_exec_mode = "N/A"
+        dcm4che_exec_reason = "N/A"
+        dcm4che_java_exec = ""
+        if self.cfg.toolkit == "dcm4che":
+            if IS_WINDOWS and self.cfg.dcm4che_prefer_java_direct:
+                dcm4che_java_exec, java_reason = resolve_java_executable()
+                if dcm4che_java_exec:
+                    dcm4che_exec_mode = "JAVA_DIRECT"
+                    dcm4che_exec_reason = f"java={dcm4che_java_exec}"
+                else:
+                    dcm4che_exec_mode = "CMD_BAT"
+                    dcm4che_exec_reason = f"java_unavailable={java_reason}"
+            else:
+                dcm4che_exec_mode = "CMD_BAT"
+                dcm4che_exec_reason = "java_direct_disabled_or_non_windows"
+            if dcm4che_exec_mode == "CMD_BAT" and not self.cfg.dcm4che_use_shell_wrapper:
+                self._log("[WARN] dcm4che sem wrapper de shell ativo (modo experimental).")
         self._log(
             f"[SEND_CONFIG] toolkit={self.cfg.toolkit} "
-            f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
+            f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
+            f"dcm4che_exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
+            f"dcm4che_exec_reason={dcm4che_exec_reason if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
         )
         self._log("[RUN_LAYOUT] mode=send layout=core|telemetry|reports")
 
@@ -1146,6 +1318,24 @@ class SendWorkflow:
         send_summary = resolve_run_artifact_path(run_dir, "send_summary.csv", for_write=True, logger=self._log)
         checkpoint = resolve_run_artifact_path(run_dir, checkpoint_name, for_write=True, logger=self._log)
         args_dir = resolve_run_batch_args_dir(run_dir, for_write=True, logger=self._log)
+        chunk_cmd_dir = run_dir / RUN_SUBDIR_TELEMETRY / "chunk_commands"
+        if done_units == 0 and chunk_cmd_dir.exists():
+            for fp in chunk_cmd_dir.glob("*"):
+                if fp.is_file():
+                    fp.unlink()
+        chunk_cmd_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.cfg.toolkit == "dcm4che":
+            self._log(
+                f"[SEND_EXEC_MODE] toolkit=dcm4che mode={dcm4che_exec_mode} reason={dcm4che_exec_reason}"
+            )
+            write_telemetry_event(
+                events,
+                run,
+                "RUN_SEND_MODE",
+                "Modo de execucao do envio definido.",
+                f"toolkit=dcm4che;mode={dcm4che_exec_mode};reason={dcm4che_exec_reason}",
+            )
 
         if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
             manifest_folders = resolve_run_artifact_path(run_dir, "manifest_folders.csv", for_write=False, logger=self._log)
@@ -1159,12 +1349,10 @@ class SendWorkflow:
             else:
                 ordered_folders = sorted(folder_keys)
             units_total = len(ordered_folders)
-            chunks = [ordered_folders[i : i + batch_size] for i in range(done_units, units_total, batch_size)]
-            total_chunks = math.ceil(units_total / batch_size) if units_total else 0
+            raw_chunks = [ordered_folders[i : i + batch_size] for i in range(done_units, units_total, batch_size)]
         else:
             units_total = total_items
-            chunks = [selected[i : i + batch_size] for i in range(done_units, units_total, batch_size)]
-            total_chunks = math.ceil(units_total / batch_size) if units_total else 0
+            raw_chunks = [selected[i : i + batch_size] for i in range(done_units, units_total, batch_size)]
 
         if units_total > 0 and done_units >= units_total:
             prev_status = ""
@@ -1181,6 +1369,55 @@ class SendWorkflow:
             self._log(msg)
             write_telemetry_event(events, run, "RUN_SEND_SKIP_ALREADY_COMPLETED", msg, f"prev_status={prev_status or 'N/A'}")
             return {"run_id": run, "status": status, "run_dir": str(run_dir)}
+
+        chunk_start_index = (done_units // batch_size) + 1
+        prepared_chunks: list[tuple[list[Path], list[Path], int, int, int]] = []
+        for original_chunk_no, batch in enumerate(raw_chunks, start=chunk_start_index):
+            if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
+                base_inputs = [Path(x) for x in batch]
+                base_files: list[Path] = []
+                for folder in batch:
+                    base_files.extend(folder_to_files.get(str(folder), []))
+            else:
+                base_inputs = list(batch)
+                base_files = list(batch)
+
+            split_inputs_batches: list[list[Path]] = [base_inputs]
+            if self.cfg.toolkit == "dcm4che" and dcm4che_exec_mode == "CMD_BAT":
+                split_inputs_batches, split_budget, split_max_len = self._split_dcm4che_inputs_by_cmd_limit(base_inputs)
+                if split_max_len > split_budget:
+                    self._log(
+                        f"[CMDLEN_GUARD_WARN] chunk_origem={original_chunk_no} "
+                        f"cmdline_len_max={split_max_len} budget={split_budget} "
+                        "ha unidade individual acima do limite; tentativa de envio seguira em unidade minima."
+                    )
+                if len(split_inputs_batches) > 1:
+                    self._log(
+                        f"[CHUNK_SPLIT] chunk_origem={original_chunk_no} "
+                        f"subchunks={len(split_inputs_batches)} budget={split_budget}"
+                    )
+                    write_telemetry_event(
+                        events,
+                        run,
+                        "CHUNK_SPLIT_PLAN",
+                        "Chunk dividido por limite de linha de comando.",
+                        (
+                            f"chunk_original={original_chunk_no};subchunks={len(split_inputs_batches)};"
+                            f"budget={split_budget};cmdline_len_max={split_max_len}"
+                        ),
+                    )
+
+            split_total = len(split_inputs_batches)
+            for split_pos, split_inputs in enumerate(split_inputs_batches, start=1):
+                if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
+                    split_files: list[Path] = []
+                    for folder in split_inputs:
+                        split_files.extend(folder_to_files.get(str(folder), []))
+                else:
+                    split_files = list(split_inputs)
+                prepared_chunks.append((split_inputs, split_files, original_chunk_no, split_pos, split_total))
+
+        total_chunks = (chunk_start_index - 1) + len(prepared_chunks)
 
         result_fields = [
             "run_id",
@@ -1204,12 +1441,14 @@ class SendWorkflow:
             "Envio iniciado.",
             (
                 f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit};"
-                f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
+                f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'};"
+                f"dcm4che_exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
             ),
         )
         self._log(
             f"[SEND_START] total_items={total_items} batch={batch_size} "
-            f"toolkit={self.cfg.toolkit} mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
+            f"toolkit={self.cfg.toolkit} mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
+            f"exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
         )
 
         sent_ok = 0
@@ -1227,32 +1466,33 @@ class SendWorkflow:
         item_cursor = done_files
         unit_cursor = done_units
 
-        for chunk_index, batch in enumerate(chunks, start=(done_units // batch_size) + 1):
+        for chunk_index, (batch_inputs, batch_files, original_chunk_no, split_pos, split_total) in enumerate(
+            prepared_chunks, start=chunk_start_index
+        ):
             if self.cancel_event.is_set():
                 interrupted = True
                 break
-            if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
-                batch_inputs = [Path(x) for x in batch]
-                batch_files: list[Path] = []
-                for folder in batch:
-                    batch_files.extend(folder_to_files.get(str(folder), []))
-            else:
-                batch_inputs = list(batch)
-                batch_files = list(batch)
             first_item = item_cursor + 1
             last_item = min(item_cursor + len(batch_files), total_items)
             self.progress_callback(first_item, total_items, chunk_index, total_chunks)
+            split_info = ""
+            if split_total > 1:
+                split_info = f" split={split_pos}/{split_total} origin={original_chunk_no}"
             self._log(
                 f"[CHUNK_START] chunk={chunk_index}/{total_chunks} "
                 f"itens={first_item}-{last_item}/{total_items} "
-                f"units={len(batch_inputs)} files={len(batch_files)}"
+                f"units={len(batch_inputs)} files={len(batch_files)}{split_info}"
             )
             write_telemetry_event(
                 events,
                 run,
                 "CHUNK_START",
                 "Chunk iniciado.",
-                f"chunk_no={chunk_index};items={len(batch_files)};units={len(batch_inputs)}",
+                (
+                    f"chunk_no={chunk_index};items={len(batch_files)};units={len(batch_inputs)};"
+                    f"exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'TOOLKIT_DEFAULT'};"
+                    f"split_pos={split_pos};split_total={split_total};origin_chunk={original_chunk_no}"
+                ),
             )
 
             args_file = args_dir / f"batch_{chunk_index:06d}.txt"
@@ -1260,7 +1500,75 @@ class SendWorkflow:
                 for file_path in batch_files:
                     f.write(f"\"{file_path}\"\n")
 
-            cmd = self.driver.storescu_cmd(self.cfg, batch_inputs, args_file)
+            java_args_file: Path | None = None
+            cmd_mode = "TOOLKIT_DEFAULT"
+            cmd_budget = WINDOWS_DIRECT_SAFE_MAX_CHARS
+            if self.cfg.toolkit == "dcm4che":
+                if dcm4che_exec_mode == "JAVA_DIRECT":
+                    cmd_mode = "JAVA_DIRECT"
+                    cmd, java_args_file = self._build_dcm4che_java_cmd(dcm4che_java_exec, batch_inputs, args_file)
+                    self._log(
+                        f"[JAVA_ARGFILE_WRITE] chunk={chunk_index}/{total_chunks} file={java_args_file} "
+                        "escape=BACKSLASH_ESCAPED_QUOTED"
+                    )
+                    write_telemetry_event(
+                        events,
+                        run,
+                        "CHUNK_JAVA_ARGFILE",
+                        "Arquivo @argfile Java gerado para o chunk.",
+                        (
+                            f"chunk_no={chunk_index};java_args_file={java_args_file};"
+                            "escape=BACKSLASH_ESCAPED_QUOTED"
+                        ),
+                    )
+                else:
+                    cmd_mode = "CMD_BAT"
+                    cmd = self._build_dcm4che_cmd_bat(batch_inputs)
+                    cmd_budget = self._dcm4che_cmd_budget()
+            else:
+                cmd = self.driver.storescu_cmd(self.cfg, batch_inputs, args_file)
+
+            cmdline_len = command_line_len(cmd)
+            command_trace_file = chunk_cmd_dir / f"chunk_{chunk_index:06d}.cmd.txt"
+            self._write_chunk_command_trace(
+                trace_file=command_trace_file,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                cmd_mode=cmd_mode,
+                cmd=cmd,
+                cmdline_len=cmdline_len,
+                budget=cmd_budget,
+                args_file=args_file,
+                java_args_file=java_args_file,
+            )
+            self._log(
+                f"[CHUNK_CMD] chunk={chunk_index}/{total_chunks} mode={cmd_mode} "
+                f"cmdline_len={cmdline_len} budget={cmd_budget} trace={command_trace_file}"
+            )
+            write_telemetry_event(
+                events,
+                run,
+                "CHUNK_CMD_META",
+                "Metadados de comando do chunk.",
+                (
+                    f"chunk_no={chunk_index};mode={cmd_mode};cmdline_len={cmdline_len};budget={cmd_budget};"
+                    f"trace={command_trace_file};args_file={args_file};split_pos={split_pos};split_total={split_total};"
+                    f"origin_chunk={original_chunk_no}"
+                ),
+            )
+            if cmd_mode == "CMD_BAT" and cmdline_len > cmd_budget:
+                write_telemetry_event(
+                    events,
+                    run,
+                    "CHUNK_CMD_OVER_LIMIT",
+                    "Comando acima do limite seguro.",
+                    f"chunk_no={chunk_index};cmdline_len={cmdline_len};budget={cmd_budget}",
+                )
+                raise RuntimeError(
+                    f"Chunk {chunk_index} excedeu limite seguro de linha de comando: "
+                    f"cmdline_len={cmdline_len} budget={cmd_budget}"
+                )
+
             lines: list[str] = []
             exit_code = -1
             with log_file.open("a", encoding="utf-8", errors="replace") as lf:
@@ -1549,11 +1857,16 @@ class SendWorkflow:
                 run,
                 "CHUNK_END",
                 "Chunk concluido.",
-                f"chunk_no={chunk_index};exit_code={exit_code}",
+                (
+                    f"chunk_no={chunk_index};exit_code={exit_code};"
+                    f"exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'TOOLKIT_DEFAULT'};"
+                    f"split_pos={split_pos};split_total={split_total};origin_chunk={original_chunk_no}"
+                ),
             )
             self._log(
                 f"[CHUNK_END] chunk={chunk_index}/{total_chunks} exit_code={exit_code} "
-                f"processed_items={item_cursor}/{total_items}"
+                f"processed_items={item_cursor}/{total_items} "
+                f"exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'TOOLKIT_DEFAULT'}"
             )
 
         final_status = "INTERRUPTED" if interrupted else ("PASS" if failed == 0 and warned == 0 else ("PASS_WITH_WARNINGS" if failed == 0 else "FAIL"))

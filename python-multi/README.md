@@ -44,6 +44,7 @@ Cada `run_id` agora organiza os artefatos em subpastas:
 - `telemetry/`
   - `events.csv` (telemetria consolidada do run)
   - `storescu_execucao.log`
+  - `chunk_commands/` (dump do comando efetivo por chunk, incluindo modo de execucao)
 - `reports/`
   - `reconciliation_report.csv`
   - `validation_full_report_A.csv` (quando exportado no modo A)
@@ -78,9 +79,10 @@ Exemplos práticos de leitura:
 - Início e fim da análise: `ANALYSIS_END`, `ANALYSIS_CANCELLED`
 - Envio:
   - `RUN_SEND_START`, `CHUNK_START`, `CHUNK_END`, `RUN_SEND_END`
+  - `RUN_SEND_MODE`, `CHUNK_CMD_META`, `CHUNK_SPLIT_PLAN`, `CHUNK_CMD_OVER_LIMIT`, `CHUNK_JAVA_ARGFILE`
   - Falha por item: `SEND_FILE_ERROR` (use `ref` para localizar `file_path` e `error_type`)
   - Erros de parsing/scan no storescu: `SEND_PARSE_EXCEPTION`
-  - Marcadores de diagnostico no log: `[SEND_START]`, `[CHUNK_START]`, `[CHUNK_END]`, `[SEND_END]`, `[SEND_PARSE_MISMATCH]`, `[RUN_ID_GUARD]`, `[BATCH_AUTO_MAX]`, `[BATCH_LIMIT_GUARD]`
+  - Marcadores de diagnostico no log: `[SEND_START]`, `[SEND_EXEC_MODE]`, `[CHUNK_START]`, `[CHUNK_CMD]`, `[CHUNK_SPLIT]`, `[CMDLEN_GUARD_WARN]`, `[CHUNK_END]`, `[SEND_END]`, `[SEND_PARSE_MISMATCH]`, `[RUN_ID_GUARD]`, `[BATCH_AUTO_MAX]`, `[BATCH_LIMIT_GUARD]`
 - Consistência/validação: `CONSISTENCY_FILLED`, `CONSISTENCY_MISSING`
 - Execução sem trabalho novo: `RUN_SEND_SKIP_ALREADY_COMPLETED`
 
@@ -123,10 +125,15 @@ No menu `Configuracao -> Configuracoes`:
 - PACS DICOM host (C-STORE) e PACS DICOM port (C-STORE)
 - Host REST para validacao
 - Tamanho de batch
-  - para `dcm4che`, apos a analise o app calcula automaticamente `batch_max_cmd` com base nos caminhos selecionados e no limite seguro da linha de comando
+  - para `dcm4che` no Windows, o envio prefere `JAVA_DIRECT` com `@argfile` (evita limitacao do `cmd`)
+  - no `JAVA_DIRECT`, os argumentos do `@argfile` sao serializados com escape explicito de barra invertida para suportar paths Windows com espacos
+  - pre-requisito Java para `JAVA_DIRECT`: recomendado `Java 17 LTS` (testado com `Temurin 17.0.18`)
+  - download recomendado: `Eclipse Temurin (Adoptium)` em `https://adoptium.net/temurin/releases/?version=17`
+  - se `JAVA_DIRECT` nao estiver disponivel, o app usa fallback `CMD_BAT` e aplica guarda por tamanho real do comando
+  - na analise, `batch_max_cmd` continua sendo salvo em `analysis_summary.csv` para rastreabilidade
   - o campo de batch e ajustado automaticamente para esse teto quando a analise termina e quando um `run_id` e selecionado no `Send`
   - voce pode reduzir manualmente; se tentar aumentar acima do teto, o app ajusta de volta e registra `[BATCH_LIMIT_GUARD]`
-  - no inicio do `Send`, ha validacao preventiva: se o valor estiver acima do teto, o app corrige para o limite antes de enviar (sem split runtime de sub-batches)
+  - no fallback `CMD_BAT`, antes do envio o app divide chunks automaticamente quando a linha de comando excede o limite seguro (split preventivo)
   - em `dcmtk`, essa limitacao de linha de comando nao e aplicada para arquivos (uso de `@args`)
 - Regras de indexacao por extensao
   - lista separada por virgula, ex.: `.dcm,.ima,.dicom`
