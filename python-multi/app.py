@@ -39,6 +39,8 @@ UID_TAG_0008_0018 = re.compile(r"\(0008,0018\)[^\[]*\[([^\]]*)\]", re.IGNORECASE
 UID_TAG_0002_0010 = re.compile(r"\(0002,0010\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
 UID_VALUE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)+")
 IS_WINDOWS = os.name == "nt"
+WINDOWS_CMD_SAFE_MAX_CHARS = 7600
+WINDOWS_DIRECT_SAFE_MAX_CHARS = 30000
 
 
 def hidden_process_kwargs() -> dict:
@@ -72,6 +74,42 @@ class AppConfig:
     dcm4che_send_mode: str = "MANIFEST_FILES"
     # Internal flag: keep Windows-stable wrapper for .bat execution by default.
     dcm4che_use_shell_wrapper: bool = True
+
+
+def _windows_cmdline_arg_len(arg: str) -> int:
+    return len(subprocess.list2cmdline([str(arg)]))
+
+
+def _windows_cmdline_len(args: list[str]) -> int:
+    return len(subprocess.list2cmdline([str(x) for x in args]))
+
+
+def estimate_dcm4che_batch_max_cmd(cfg: AppConfig, unit_max_arg_len: int, units_total: int) -> tuple[int, str, int]:
+    source = "DCM4CHE_CMD_LIMIT"
+    budget = WINDOWS_CMD_SAFE_MAX_CHARS if (IS_WINDOWS and cfg.dcm4che_use_shell_wrapper) else WINDOWS_DIRECT_SAFE_MAX_CHARS
+    if units_total <= 0:
+        return 0, source, budget
+    if unit_max_arg_len <= 0:
+        return units_total, source, budget
+
+    try:
+        storescu = Path(cfg.dcm4che_bin_path) / "storescu.bat"
+        base = [str(storescu), "-c", f"{cfg.aet_destino}@{cfg.pacs_host}:{cfg.pacs_port}"]
+        cmd_args = ["cmd", "/c", *base] if cfg.dcm4che_use_shell_wrapper else base
+        base_len = _windows_cmdline_len(cmd_args)
+    except Exception:
+        # Conservative fallback if command assembly fails for any reason.
+        storescu_guess = str(Path(cfg.dcm4che_bin_path or "dcm4che/bin") / "storescu.bat")
+        base = [storescu_guess, "-c", f"{cfg.aet_destino}@{cfg.pacs_host}:{cfg.pacs_port}"]
+        cmd_args = ["cmd", "/c", *base] if cfg.dcm4che_use_shell_wrapper else base
+        base_len = _windows_cmdline_len(cmd_args)
+
+    remaining = budget - base_len
+    per_unit_cost = 1 + unit_max_arg_len  # 1 space + quoted arg length
+    if remaining < per_unit_cost:
+        return 0, source, budget
+    max_units = remaining // per_unit_cost
+    return min(units_total, max_units), source, budget
 
 
 def now_iso() -> str:
@@ -167,6 +205,10 @@ def format_eta(seconds: float | None) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def format_duration_sec(seconds: float) -> str:
+    return f"{max(seconds, 0.0):.1f}s"
 
 
 class WorkflowCancelled(Exception):
@@ -664,6 +706,7 @@ class AnalyzeWorkflow:
         return f"{base}_{suffix}"
 
     def run_analysis(self, exam_root: str, batch_size: int, run_id: str = "") -> dict:
+        analysis_start_ts = time.monotonic()
         script_dir = Path(__file__).resolve().parent
         runs_base = self._resolve_runs_base(script_dir)
         runs_base.mkdir(parents=True, exist_ok=True)
@@ -720,6 +763,7 @@ class AnalyzeWorkflow:
         selected_bytes = 0
         excluded_files = 0
         selected_folder_keys: set[str] = set()
+        selected_file_arg_len_max = 0
 
         file_fields = [
             "run_id",
@@ -806,6 +850,8 @@ class AnalyzeWorkflow:
                                 selected_files += 1
                                 selected_bytes += size_actual
                                 selected_folder_keys.add(folder_key)
+                                if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode != "FOLDERS":
+                                    selected_file_arg_len_max = max(selected_file_arg_len_max, _windows_cmdline_arg_len(entry.path))
                             else:
                                 excluded_files += 1
 
@@ -882,6 +928,28 @@ class AnalyzeWorkflow:
         selected_folder_count = len(selected_folder_keys)
         chunk_base_count = selected_folder_count if use_folder_unit else selected_files
         chunk_total = math.ceil(chunk_base_count / batch_size) if chunk_base_count else 0
+        analysis_duration_sec = round(max(time.monotonic() - analysis_start_ts, 0.0), 3)
+        batch_max_cmd = ""
+        batch_max_cmd_source = "N/A"
+        if self.cfg.toolkit == "dcm4che":
+            if use_folder_unit:
+                unit_max_arg_len = 0
+                for folder_key in selected_folder_keys:
+                    unit_max_arg_len = max(unit_max_arg_len, _windows_cmdline_arg_len(folder_key))
+            else:
+                unit_max_arg_len = selected_file_arg_len_max
+            batch_max_cmd_value, batch_max_cmd_source, cmd_budget = estimate_dcm4che_batch_max_cmd(
+                self.cfg,
+                unit_max_arg_len=unit_max_arg_len,
+                units_total=chunk_base_count,
+            )
+            batch_max_cmd = str(batch_max_cmd_value)
+            self._log(
+                f"[BATCH_AUTO_MAX] source={batch_max_cmd_source} limit={batch_max_cmd_value} "
+                f"units_total={chunk_base_count} unit_max_arg_len={unit_max_arg_len} budget={cmd_budget}"
+            )
+        else:
+            self._log("[BATCH_AUTO_MAX] source=N/A toolkit=dcmtk")
         summary_fields = [
             "run_id",
             "root_path",
@@ -897,6 +965,9 @@ class AnalyzeWorkflow:
             "size_collection_enabled",
             "chunk_unit",
             "chunks_total",
+            "analysis_duration_sec",
+            "batch_max_cmd",
+            "batch_max_cmd_source",
             "generated_at",
         ]
         write_csv_row(
@@ -916,6 +987,9 @@ class AnalyzeWorkflow:
                 "size_collection_enabled": "1" if self.cfg.collect_size_bytes else "0",
                 "chunk_unit": chunk_unit,
                 "chunks_total": chunk_total,
+                "analysis_duration_sec": analysis_duration_sec,
+                "batch_max_cmd": batch_max_cmd,
+                "batch_max_cmd_source": batch_max_cmd_source,
                 "generated_at": now_br(),
             },
             summary_fields,
@@ -928,13 +1002,16 @@ class AnalyzeWorkflow:
             (
                 f"files_total={total_files};selected_files={selected_files};selected_folders={selected_folder_count};"
                 f"chunks={chunk_total};chunk_unit={chunk_unit};scan_errors={scan_errors};"
-                f"collect_size_bytes={'1' if self.cfg.collect_size_bytes else '0'}"
+                f"collect_size_bytes={'1' if self.cfg.collect_size_bytes else '0'};"
+                f"batch_max_cmd={batch_max_cmd or 'N/A'};batch_max_cmd_source={batch_max_cmd_source};"
+                f"analysis_duration_sec={analysis_duration_sec}"
             ),
         )
 
         self._log(
             f"[AN_RESULT] arquivos={total_files} selecionados={selected_files} "
-            f"pastas_selecionadas={selected_folder_count} chunks={chunk_total} ({chunk_unit})"
+            f"pastas_selecionadas={selected_folder_count} chunks={chunk_total} ({chunk_unit}) "
+            f"duration={format_duration_sec(analysis_duration_sec)}"
         )
         self._log(f"[AN_END] run_id={run} status=PASS")
         self._progress(
@@ -952,6 +1029,9 @@ class AnalyzeWorkflow:
             "folders_selected": selected_folder_count,
             "size_total_bytes": total_bytes,
             "size_selected_bytes": selected_bytes,
+            "analysis_duration_sec": analysis_duration_sec,
+            "batch_max_cmd": batch_max_cmd,
+            "batch_max_cmd_source": batch_max_cmd_source,
         }
 
 
@@ -996,6 +1076,7 @@ class SendWorkflow:
             pass
 
     def run_send(self, run_id: str, batch_size: int, show_output: bool = True) -> dict:
+        send_start_ts = time.monotonic()
         script_dir = Path(__file__).resolve().parent
         runs_base = self._resolve_runs_base(script_dir)
         run = run_id.strip()
@@ -1476,6 +1557,7 @@ class SendWorkflow:
             )
 
         final_status = "INTERRUPTED" if interrupted else ("PASS" if failed == 0 and warned == 0 else ("PASS_WITH_WARNINGS" if failed == 0 else "FAIL"))
+        send_duration_sec = round(max(time.monotonic() - send_start_ts, 0.0), 3)
         write_csv_row(
             send_summary,
             {
@@ -1488,13 +1570,26 @@ class SendWorkflow:
                 "warnings": warned,
                 "failed": failed,
                 "status": final_status,
+                "send_duration_sec": send_duration_sec,
                 "finished_at": now_br(),
             },
-            ["run_id", "toolkit", "ts_mode_effective", "total_items", "items_processed", "sent_ok", "warnings", "failed", "status", "finished_at"],
+            ["run_id", "toolkit", "ts_mode_effective", "total_items", "items_processed", "sent_ok", "warnings", "failed", "status", "send_duration_sec", "finished_at"],
         )
-        write_telemetry_event(events, run, "RUN_SEND_END", "Envio finalizado.", f"status={final_status}")
-        self._log(f"[SEND_END] status={final_status} processed_items={item_cursor}/{total_items}")
-        self._log(f"[SEND_RESULT] ok={sent_ok} warn={warned} fail={failed} status={final_status}")
+        write_telemetry_event(
+            events,
+            run,
+            "RUN_SEND_END",
+            "Envio finalizado.",
+            f"status={final_status};send_duration_sec={send_duration_sec}",
+        )
+        self._log(
+            f"[SEND_END] status={final_status} processed_items={item_cursor}/{total_items} "
+            f"duration={format_duration_sec(send_duration_sec)}"
+        )
+        self._log(
+            f"[SEND_RESULT] ok={sent_ok} warn={warned} fail={failed} status={final_status} "
+            f"duration={format_duration_sec(send_duration_sec)}"
+        )
         if warned > 0:
             self._log(
                 "[SEND_WARN_SUMMARY] "
@@ -1505,7 +1600,7 @@ class SendWorkflow:
                 f"uid_empty_unexpected={warn_type_counts.get('UID_EMPTY_UNEXPECTED', 0)} "
                 f"parse_exception_files={warn_type_counts.get('PARSE_EXCEPTION', 0)}"
             )
-        return {"run_id": run, "status": final_status, "run_dir": str(run_dir)}
+        return {"run_id": run, "status": final_status, "run_dir": str(run_dir), "send_duration_sec": send_duration_sec}
 
 
 class ValidationWorkflow:
@@ -1777,6 +1872,7 @@ class ValidationWorkflow:
         return {"run_id": run, "mode": mode, "report_file": str(report_file), "rows": len(rows_c), "ok": status_ok, "erro": status_err}
 
     def run_validation(self, run_id: str) -> dict:
+        validation_start_ts = time.monotonic()
         run = run_id.strip()
         if not run:
             raise RuntimeError("run_id e obrigatorio para validacao.")
@@ -1954,6 +2050,7 @@ class ValidationWorkflow:
             final_status = "PASS_WITH_WARNINGS"
         if api_err_count > 0 and ok_count == 0:
             final_status = "FAIL"
+        validation_duration_sec = round(max(time.monotonic() - validation_start_ts, 0.0), 3)
 
         write_csv_row(
             recon,
@@ -1967,9 +2064,22 @@ class ValidationWorkflow:
                 "send_warning_files": warnings_count,
                 "send_failed_files": fail_count,
                 "final_status": final_status,
+                "validation_duration_sec": validation_duration_sec,
                 "generated_at": now_br(),
             },
-            ["run_id", "toolkit", "total_iuid_unique", "iuid_ok", "iuid_not_found", "iuid_api_error", "send_warning_files", "send_failed_files", "final_status", "generated_at"],
+            [
+                "run_id",
+                "toolkit",
+                "total_iuid_unique",
+                "iuid_ok",
+                "iuid_not_found",
+                "iuid_api_error",
+                "send_warning_files",
+                "send_failed_files",
+                "final_status",
+                "validation_duration_sec",
+                "generated_at",
+            ],
         )
         self._log("[VAL_RESULT] --- Resumo Final Validacao ---")
         self._log(f"Run ID: {run}")
@@ -1981,7 +2091,7 @@ class ValidationWorkflow:
         self._log(f"IUIDs OK: {ok_count}")
         self._log(f"IUIDs NOT_FOUND: {miss_count}")
         self._log(f"IUIDs API_ERROR: {api_err_count}")
-        self._log(f"[VAL_END] run_id={run} status={final_status}")
+        self._log(f"[VAL_END] run_id={run} status={final_status} duration={format_duration_sec(validation_duration_sec)}")
         write_telemetry_event(
             events,
             run,
@@ -1989,10 +2099,11 @@ class ValidationWorkflow:
             "Validacao finalizada.",
             (
                 f"status={final_status};iuid_total={len(iuid_to_files)};iuid_ok={ok_count};"
-                f"iuid_not_found={miss_count};iuid_api_error={api_err_count}"
+                f"iuid_not_found={miss_count};iuid_api_error={api_err_count};"
+                f"validation_duration_sec={validation_duration_sec}"
             ),
         )
-        return {"run_id": run, "status": final_status, "run_dir": str(run_dir)}
+        return {"run_id": run, "status": final_status, "run_dir": str(run_dir), "validation_duration_sec": validation_duration_sec}
 
 
 class ConfigDialog(tk.Toplevel):
@@ -2190,6 +2301,9 @@ class App(tk.Tk):
         self._activity_context = ""
         self._activity_running = False
         self._activity_bars: list[ttk.Progressbar] = []
+        self._batch_size_max_cmd_limit: int | None = None
+        self._batch_size_max_cmd_source = ""
+        self._batch_size_trace_guard = False
 
         self._build_menu()
         self._setup_ui_styles()
@@ -2227,6 +2341,8 @@ class App(tk.Tk):
         self.config_obj = cfg
         self.config_file.write_text(json.dumps(asdict(cfg), ensure_ascii=True, indent=2), encoding="utf-8")
         self.var_batch_size.set(str(cfg.batch_size_default))
+        self._batch_size_max_cmd_limit = None
+        self._batch_size_max_cmd_source = ""
         self._log_an(
             f"[CFG_SAVE] toolkit={cfg.toolkit} aet_origem={cfg.aet_origem} aet_destino={cfg.aet_destino} "
             f"pacs_dicom={cfg.pacs_host}:{cfg.pacs_port} pacs_rest={cfg.pacs_rest_host} "
@@ -2284,6 +2400,7 @@ class App(tk.Tk):
         top.pack(fill="x")
         self.var_exam_root = tk.StringVar()
         self.var_batch_size = tk.StringVar(value=str(self.config_obj.batch_size_default))
+        self.var_batch_size.trace_add("write", self._on_batch_size_changed)
         self.var_run_id = tk.StringVar()
         ttk.Label(top, text="Pasta exames").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_exam_root, width=90).grid(row=0, column=1, sticky="we", padx=6)
@@ -2346,6 +2463,7 @@ class App(tk.Tk):
         ttk.Label(top, text="Run ID analisado").grid(row=0, column=0, sticky="w")
         self.cmb_send_runs = ttk.Combobox(top, textvariable=self.var_send_run, width=36)
         self.cmb_send_runs.grid(row=0, column=1, sticky="w", padx=6)
+        self.cmb_send_runs.bind("<<ComboboxSelected>>", lambda _e: self._on_send_run_selected())
         ttk.Button(top, text="Atualizar", command=self._refresh_run_list).grid(row=0, column=2, padx=4)
         ttk.Checkbutton(
             top,
@@ -2364,11 +2482,17 @@ class App(tk.Tk):
         ttk.Button(btns, text="Iniciar Send", command=self._start_send).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancelar", command=self._cancel_current_job).pack(side="left", padx=4)
 
-        prog = ttk.LabelFrame(self.tab_send, text="Progresso", padding=10)
-        prog.pack(fill="x", padx=10, pady=8)
+        status_row = ttk.Frame(self.tab_send, padding=(10, 0, 10, 8))
+        status_row.pack(fill="x")
+
+        prog = ttk.LabelFrame(status_row, text="Progresso", padding=10)
+        prog.pack(side="left", fill="x", expand=True, padx=(0, 8))
         ttk.Label(prog, textvariable=self.progress_items_var).pack(anchor="w")
         ttk.Label(prog, textvariable=self.progress_chunks_var).pack(anchor="w")
-        activity = ttk.Frame(self.tab_send, padding=(10, 0, 10, 4))
+
+        side_panel = ttk.LabelFrame(status_row, text="Atividade e Filtros", padding=10)
+        side_panel.pack(side="left", fill="y")
+        activity = ttk.Frame(side_panel)
         activity.pack(fill="x")
         ttk.Label(activity, text="Atividade:").pack(side="left")
         ttk.Label(activity, textvariable=self.activity_status_send).pack(side="left", padx=(6, 10))
@@ -2380,8 +2504,9 @@ class App(tk.Tk):
         )
         self.pb_activity_send.pack(side="left")
         self._activity_bars.append(self.pb_activity_send)
-        filter_bar = ttk.Frame(self.tab_send, padding=(10, 0, 10, 4))
-        filter_bar.pack(fill="x")
+
+        filter_bar = ttk.Frame(side_panel)
+        filter_bar.pack(fill="x", pady=(8, 0))
         ttk.Label(filter_bar, text="Filtro de log (tela)").pack(side="left")
         cmb_filter_send = ttk.Combobox(
             filter_bar,
@@ -2486,6 +2611,7 @@ class App(tk.Tk):
         self.lst_runs.delete(0, tk.END)
         for r in runs:
             self.lst_runs.insert(tk.END, r)
+        self._on_send_run_selected()
 
     def _open_selected_run_folder(self):
         sel = self.lst_runs.curselection()
@@ -2517,6 +2643,105 @@ class App(tk.Tk):
 
     def _worker_busy(self) -> bool:
         return self.worker_thread is not None and self.worker_thread.is_alive()
+
+    def _safe_int(self, value, default: int = 0) -> int:
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return default
+
+    def _set_batch_size_ui_value(self, value: int) -> None:
+        self._batch_size_trace_guard = True
+        try:
+            self.var_batch_size.set(str(value))
+        finally:
+            self._batch_size_trace_guard = False
+
+    def _on_batch_size_changed(self, *_args) -> None:
+        if self._batch_size_trace_guard:
+            return
+        limit = self._batch_size_max_cmd_limit
+        if limit is None or limit <= 0:
+            return
+        raw = (self.var_batch_size.get() or "").strip()
+        if not raw:
+            return
+        try:
+            value = int(raw)
+        except Exception:
+            return
+        if value > limit:
+            self._set_batch_size_ui_value(limit)
+            self._log_an(f"[BATCH_LIMIT_GUARD] batch={value} excede limite={limit}; ajustado automaticamente.")
+
+    def _read_run_analysis_summary(self, run_id: str) -> dict:
+        rid = (run_id or "").strip()
+        if not rid:
+            return {}
+        run_dir = self._runs_base() / rid
+        if not run_dir.exists():
+            return {}
+        summary = resolve_run_artifact_path(run_dir, "analysis_summary.csv", for_write=False)
+        if not summary.exists():
+            return {}
+        rows = read_csv_rows(summary)
+        return rows[-1] if rows else {}
+
+    def _get_run_batch_max_cmd(self, run_id: str) -> tuple[int | None, str]:
+        row = self._read_run_analysis_summary(run_id)
+        if not row:
+            return None, ""
+        source = str(row.get("batch_max_cmd_source", "")).strip()
+        limit_raw = str(row.get("batch_max_cmd", "")).strip()
+        if source == "DCM4CHE_CMD_LIMIT" and limit_raw != "":
+            return self._safe_int(limit_raw, -1), source
+        return None, source
+
+    def _apply_batch_limit_for_run(self, run_id: str, *, notify: bool, auto_set: bool) -> None:
+        if (self.config_obj.toolkit or "").strip().lower() != "dcm4che":
+            self._batch_size_max_cmd_limit = None
+            self._batch_size_max_cmd_source = ""
+            return
+        limit, source = self._get_run_batch_max_cmd(run_id)
+        if limit is None:
+            self._batch_size_max_cmd_limit = None
+            self._batch_size_max_cmd_source = ""
+            return
+        if limit <= 0:
+            self._batch_size_max_cmd_limit = limit
+            self._batch_size_max_cmd_source = source
+            self._log_an(
+                f"[BATCH_AUTO_MAX] run_id={run_id} source={source} limite_invalido={limit} "
+                "envio sera bloqueado ate nova analise."
+            )
+            return
+        prev = self._safe_int(self.var_batch_size.get(), limit)
+        changed = (
+            self._batch_size_max_cmd_limit != limit
+            or self._batch_size_max_cmd_source != source
+            or (auto_set and prev != limit)
+        )
+        self._batch_size_max_cmd_limit = limit
+        self._batch_size_max_cmd_source = source
+        if auto_set:
+            self._set_batch_size_ui_value(limit)
+        if changed:
+            self._log_an(
+                f"[BATCH_AUTO_MAX] run_id={run_id} source={source} batch_max_cmd={limit} "
+                f"batch_anterior={prev} batch_aplicado={limit if auto_set else prev}"
+            )
+        if notify:
+            messagebox.showinfo(
+                "Batch ajustado automaticamente",
+                "Limite maximo de batch para comando do dcm4che calculado com base nos caminhos analisados.\n\n"
+                f"Run ID: {run_id}\n"
+                f"Batch maximo seguro: {limit}\n\n"
+                "Voce pode reduzir esse valor, mas aumentar acima do limite nao e permitido.",
+                parent=self,
+            )
+
+    def _on_send_run_selected(self) -> None:
+        self._apply_batch_limit_for_run(self.var_send_run.get().strip(), notify=False, auto_set=True)
 
     def _set_activity_context(self, context: str) -> None:
         self._activity_context = (context or "").strip()
@@ -2598,6 +2823,32 @@ class App(tk.Tk):
         except Exception:
             messagebox.showerror("Erro", "Batch size invalido.")
             return
+        if (self.config_obj.toolkit or "").strip().lower() == "dcm4che":
+            self._apply_batch_limit_for_run(run_id, notify=False, auto_set=False)
+            limit = self._batch_size_max_cmd_limit
+            if limit is not None and batch > limit:
+                self._set_batch_size_ui_value(limit)
+                self._log_send(
+                    f"[BATCH_LIMIT_GUARD] run_id={run_id} batch_solicitado={batch} excede limite={limit}; "
+                    f"ajustado automaticamente."
+                )
+                messagebox.showwarning(
+                    "Batch acima do limite",
+                    "O batch informado excede o limite maximo seguro do comando dcm4che.\n\n"
+                    f"Run ID: {run_id}\n"
+                    f"Limite maximo seguro: {limit}\n\n"
+                    "O valor foi ajustado automaticamente.",
+                    parent=self,
+                )
+                batch = limit
+            if limit is not None and limit <= 0:
+                messagebox.showerror(
+                    "Limite de batch invalido",
+                    "Nao foi possivel definir um batch seguro para este run no dcm4che.\n"
+                    "Revise os caminhos dos arquivos e execute a analise novamente.",
+                    parent=self,
+                )
+                return
         self.cancel_event.clear()
         self._log_send("Iniciando envio...")
         self.progress_items_var.set("enviando item 0 de 0")
@@ -2829,11 +3080,19 @@ class App(tk.Tk):
                 elif event == "val_log":
                     self._log_val(payload)
                 elif event == "an_done":
-                    self._log_an(f"Analise finalizada. Run ID: {payload.get('run_id')}")
+                    an_duration = payload.get("analysis_duration_sec")
+                    if an_duration is not None:
+                        self._log_an(
+                            f"Analise finalizada. Run ID: {payload.get('run_id')} | "
+                            f"Duracao: {format_duration_sec(float(an_duration))}"
+                        )
+                    else:
+                        self._log_an(f"Analise finalizada. Run ID: {payload.get('run_id')}")
                     self.analysis_progress_var.set("progresso analise: finalizada")
                     self.var_send_run.set(payload.get("run_id", ""))
                     self.var_val_run.set(payload.get("run_id", ""))
                     self.var_run_id.set(payload.get("run_id", ""))
+                    self._apply_batch_limit_for_run(payload.get("run_id", ""), notify=True, auto_set=True)
                     self._refresh_run_list()
                     self.lbl_dash.set(
                         "Resumo:\n"
@@ -2844,7 +3103,9 @@ class App(tk.Tk):
                         f"- arquivos selecionados: {payload.get('files_selected')}\n"
                         f"- tamanho total: {self._human_size(int(payload.get('size_total_bytes') or 0))}\n"
                         f"- tamanho selecionado: {self._human_size(int(payload.get('size_selected_bytes') or 0))}\n"
-                        f"- chunks estimados: {payload.get('chunks_total')} ({payload.get('chunk_unit')})"
+                        f"- chunks estimados: {payload.get('chunks_total')} ({payload.get('chunk_unit')})\n"
+                        f"- batch max cmd (dcm4che): {payload.get('batch_max_cmd') or 'N/A'}\n"
+                        f"- duracao analise: {format_duration_sec(float(payload.get('analysis_duration_sec') or 0))}"
                     )
                 elif event == "send_progress":
                     done, total, cno, ctot = payload
@@ -2852,13 +3113,27 @@ class App(tk.Tk):
                     self.progress_chunks_var.set(f"batch chunk {cno} de {ctot}")
                 elif event == "send_done":
                     status = payload.get("status")
+                    send_duration = payload.get("send_duration_sec")
                     if status == "ALREADY_SENT_PASS":
                         self._log_send(f"RUN ja enviado com sucesso anteriormente. Run ID: {payload.get('run_id')}")
                     else:
-                        self._log_send(f"SEND finalizado. Run ID: {payload.get('run_id')} | Status: {status}")
+                        if send_duration is not None:
+                            self._log_send(
+                                f"SEND finalizado. Run ID: {payload.get('run_id')} | Status: {status} | "
+                                f"Duracao: {format_duration_sec(float(send_duration))}"
+                            )
+                        else:
+                            self._log_send(f"SEND finalizado. Run ID: {payload.get('run_id')} | Status: {status}")
                     self._refresh_run_list()
                 elif event == "val_done":
-                    self._log_val(f"[VAL_END] Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
+                    val_duration = payload.get("validation_duration_sec")
+                    if val_duration is not None:
+                        self._log_val(
+                            f"[VAL_END] Run ID: {payload.get('run_id')} | Status: {payload.get('status')} | "
+                            f"Duracao: {format_duration_sec(float(val_duration))}"
+                        )
+                    else:
+                        self._log_val(f"[VAL_END] Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
                     self._refresh_run_list()
                 elif event == "report_done":
                     self._log_val(

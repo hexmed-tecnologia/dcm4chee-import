@@ -18,6 +18,7 @@ Aplicacao desktop em Tkinter para fluxo DICOM com dois toolkits:
    - `manifest_folders.csv`
    - `manifest_files.csv`
    - `analysis_summary.csv`
+   - para `dcm4che`, a analise calcula e salva `batch_max_cmd` (limite maximo seguro de batch para linha de comando)
    - `run_id` automatico passa a incluir sufixo do toolkit/modo (ex.: `26022026_123000_dcm4che_folders`, `26022026_123500_dcm4che_files`, `26022026_124000_dcmtk`)
 2. Revisar dashboard de analise.
 3. Rodar `Send` por `run_id`.
@@ -79,7 +80,7 @@ Exemplos práticos de leitura:
   - `RUN_SEND_START`, `CHUNK_START`, `CHUNK_END`, `RUN_SEND_END`
   - Falha por item: `SEND_FILE_ERROR` (use `ref` para localizar `file_path` e `error_type`)
   - Erros de parsing/scan no storescu: `SEND_PARSE_EXCEPTION`
-  - Marcadores de diagnostico no log: `[SEND_PARSE_MISMATCH]` e `[RUN_ID_GUARD]`
+  - Marcadores de diagnostico no log: `[SEND_START]`, `[CHUNK_START]`, `[CHUNK_END]`, `[SEND_END]`, `[SEND_PARSE_MISMATCH]`, `[RUN_ID_GUARD]`, `[BATCH_AUTO_MAX]`, `[BATCH_LIMIT_GUARD]`
 - Consistência/validação: `CONSISTENCY_FILLED`, `CONSISTENCY_MISSING`
 - Execução sem trabalho novo: `RUN_SEND_SKIP_ALREADY_COMPLETED`
 
@@ -122,6 +123,11 @@ No menu `Configuracao -> Configuracoes`:
 - PACS DICOM host (C-STORE) e PACS DICOM port (C-STORE)
 - Host REST para validacao
 - Tamanho de batch
+  - para `dcm4che`, apos a analise o app calcula automaticamente `batch_max_cmd` com base nos caminhos selecionados e no limite seguro da linha de comando
+  - o campo de batch e ajustado automaticamente para esse teto quando a analise termina e quando um `run_id` e selecionado no `Send`
+  - voce pode reduzir manualmente; se tentar aumentar acima do teto, o app ajusta de volta e registra `[BATCH_LIMIT_GUARD]`
+  - no inicio do `Send`, ha validacao preventiva: se o valor estiver acima do teto, o app corrige para o limite antes de enviar (sem split runtime de sub-batches)
+  - em `dcmtk`, essa limitacao de linha de comando nao e aplicada para arquivos (uso de `@args`)
 - Regras de indexacao por extensao
   - lista separada por virgula, ex.: `.dcm,.ima,.dicom`
   - opcao `Nao restringir por extensao (incluir todos os arquivos)` (desmarcada por padrao)
@@ -139,6 +145,12 @@ As toolkits sao sempre resolvidas internamente em `toolkits/<nome>-*/bin` relati
 Durante a analise, o log pode exibir marcadores `[AN_SCAN_PROGRESS]` com taxa de varredura e ETA aproximado.
 O dashboard da aba `Analise` tambem exibe um indicador visual de progresso com ETA aproximado em tempo real.
 No menu principal ha um item `Sobre` que mostra a versao atual da aplicacao.
+
+Na aba `Send`, a visualizacao de log e separada em dois canais:
+- `Exibir mensagens internas do sistema`
+- `Exibir output bruto da toolkit (tempo real)`
+
+E possivel combinar esses controles com o filtro de tela (`Todos`, `Sistema`, `Warnings + Erros`) sem alterar os arquivos de log em disco.
 
 ## Versionamento
 
