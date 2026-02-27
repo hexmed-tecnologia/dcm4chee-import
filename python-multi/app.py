@@ -956,9 +956,10 @@ class AnalyzeWorkflow:
 
 
 class SendWorkflow:
-    def __init__(self, cfg: AppConfig, logger, cancel_event: threading.Event, progress_callback):
+    def __init__(self, cfg: AppConfig, logger, cancel_event: threading.Event, progress_callback, toolkit_logger=None):
         self.cfg = cfg
         self.logger = logger
+        self.toolkit_logger = toolkit_logger or logger
         self.cancel_event = cancel_event
         self.progress_callback = progress_callback
         self.current_proc: subprocess.Popen | None = None
@@ -967,6 +968,9 @@ class SendWorkflow:
 
     def _log(self, msg: str) -> None:
         self.logger(msg)
+
+    def _log_toolkit(self, msg: str) -> None:
+        self.toolkit_logger(msg)
 
     def _resolve_runs_base(self, script_dir: Path) -> Path:
         if self.cfg.runs_base_dir.strip():
@@ -1122,6 +1126,10 @@ class SendWorkflow:
                 f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
             ),
         )
+        self._log(
+            f"[SEND_START] total_items={total_items} batch={batch_size} "
+            f"toolkit={self.cfg.toolkit} mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
+        )
 
         sent_ok = 0
         warned = 0
@@ -1153,7 +1161,11 @@ class SendWorkflow:
             first_item = item_cursor + 1
             last_item = min(item_cursor + len(batch_files), total_items)
             self.progress_callback(first_item, total_items, chunk_index, total_chunks)
-            self._log(f"Chunk {chunk_index}/{total_chunks} - enviando itens {first_item} ate {last_item} de {total_items}")
+            self._log(
+                f"[CHUNK_START] chunk={chunk_index}/{total_chunks} "
+                f"itens={first_item}-{last_item}/{total_items} "
+                f"units={len(batch_inputs)} files={len(batch_files)}"
+            )
             write_telemetry_event(
                 events,
                 run,
@@ -1193,7 +1205,7 @@ class SendWorkflow:
                         lf.write(line)
                         lf.flush()
                         if show_output:
-                            self._log(clean)
+                            self._log_toolkit(clean)
                     if not interrupted:
                         self.current_proc.wait()
                         exit_code = self.current_proc.returncode if self.current_proc.returncode is not None else -1
@@ -1458,6 +1470,10 @@ class SendWorkflow:
                 "Chunk concluido.",
                 f"chunk_no={chunk_index};exit_code={exit_code}",
             )
+            self._log(
+                f"[CHUNK_END] chunk={chunk_index}/{total_chunks} exit_code={exit_code} "
+                f"processed_items={item_cursor}/{total_items}"
+            )
 
         final_status = "INTERRUPTED" if interrupted else ("PASS" if failed == 0 and warned == 0 else ("PASS_WITH_WARNINGS" if failed == 0 else "FAIL"))
         write_csv_row(
@@ -1477,6 +1493,7 @@ class SendWorkflow:
             ["run_id", "toolkit", "ts_mode_effective", "total_items", "items_processed", "sent_ok", "warnings", "failed", "status", "finished_at"],
         )
         write_telemetry_event(events, run, "RUN_SEND_END", "Envio finalizado.", f"status={final_status}")
+        self._log(f"[SEND_END] status={final_status} processed_items={item_cursor}/{total_items}")
         self._log(f"[SEND_RESULT] ok={sent_ok} warn={warned} fail={failed} status={final_status}")
         if warned > 0:
             self._log(
@@ -2160,8 +2177,22 @@ class App(tk.Tk):
         self.progress_items_var = tk.StringVar(value="enviando item 0 de 0")
         self.progress_chunks_var = tk.StringVar(value="batch chunk 0 de 0")
         self.analysis_progress_var = tk.StringVar(value="progresso analise: aguardando")
+        self.log_filter_options = ["Todos", "Sistema", "Warnings + Erros"]
+        self.var_log_filter_an = tk.StringVar(value="Todos")
+        self.var_log_filter_send = tk.StringVar(value="Todos")
+        self.var_log_filter_val = tk.StringVar(value="Todos")
+        self._max_log_buffer_lines = 6000
+        self._log_buffers: dict[str, list[tuple[str, str, str]]] = {"an": [], "send": [], "val": []}
+        self._log_widgets: dict[str, tk.Text] = {}
+        self.activity_status_an = tk.StringVar(value="ocioso")
+        self.activity_status_send = tk.StringVar(value="ocioso")
+        self.activity_status_val = tk.StringVar(value="ocioso")
+        self._activity_context = ""
+        self._activity_running = False
+        self._activity_bars: list[ttk.Progressbar] = []
 
         self._build_menu()
+        self._setup_ui_styles()
         self._build_ui()
         self._poll_queue()
 
@@ -2244,6 +2275,10 @@ class App(tk.Tk):
         self._build_validation_tab()
         self._build_runs_tab()
 
+    def _setup_ui_styles(self) -> None:
+        style = ttk.Style(self)
+        style.configure("Compact.Horizontal.TProgressbar", thickness=6)
+
     def _build_analyze_tab(self):
         top = ttk.Frame(self.tab_an, padding=10)
         top.pack(fill="x")
@@ -2267,6 +2302,30 @@ class App(tk.Tk):
         self.lbl_dash = tk.StringVar(value="Sem analise executada.")
         ttk.Label(dash, textvariable=self.lbl_dash, justify="left").pack(anchor="w")
         ttk.Label(dash, textvariable=self.analysis_progress_var, justify="left").pack(anchor="w", pady=(6, 0))
+        activity = ttk.Frame(self.tab_an, padding=(10, 0, 10, 4))
+        activity.pack(fill="x")
+        ttk.Label(activity, text="Atividade:").pack(side="left")
+        ttk.Label(activity, textvariable=self.activity_status_an).pack(side="left", padx=(6, 10))
+        self.pb_activity_an = ttk.Progressbar(
+            activity,
+            mode="indeterminate",
+            length=72,
+            style="Compact.Horizontal.TProgressbar",
+        )
+        self.pb_activity_an.pack(side="left")
+        self._activity_bars.append(self.pb_activity_an)
+        filter_bar = ttk.Frame(self.tab_an, padding=(10, 0, 10, 4))
+        filter_bar.pack(fill="x")
+        ttk.Label(filter_bar, text="Filtro de log (tela)").pack(side="left")
+        cmb_filter_an = ttk.Combobox(
+            filter_bar,
+            textvariable=self.var_log_filter_an,
+            values=self.log_filter_options,
+            width=18,
+            state="readonly",
+        )
+        cmb_filter_an.pack(side="left", padx=(8, 0))
+        cmb_filter_an.bind("<<ComboboxSelected>>", lambda _e: self._refresh_log_view("an"))
 
         log_frame = ttk.Frame(self.tab_an, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
@@ -2276,19 +2335,32 @@ class App(tk.Tk):
         y.pack(side="right", fill="y")
         self.txt_an.configure(yscrollcommand=y.set)
         self._setup_log_tags(self.txt_an)
+        self._log_widgets["an"] = self.txt_an
 
     def _build_send_tab(self):
         top = ttk.Frame(self.tab_send, padding=10)
         top.pack(fill="x")
         self.var_send_run = tk.StringVar()
+        self.var_show_send_internal = tk.BooleanVar(value=True)
         self.var_show_output = tk.BooleanVar(value=True)
         ttk.Label(top, text="Run ID analisado").grid(row=0, column=0, sticky="w")
         self.cmb_send_runs = ttk.Combobox(top, textvariable=self.var_send_run, width=36)
         self.cmb_send_runs.grid(row=0, column=1, sticky="w", padx=6)
         ttk.Button(top, text="Atualizar", command=self._refresh_run_list).grid(row=0, column=2, padx=4)
-        ttk.Checkbutton(top, text="Mostrar output em tempo real", variable=self.var_show_output).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Checkbutton(
+            top,
+            text="Exibir mensagens internas do sistema",
+            variable=self.var_show_send_internal,
+            command=lambda: self._refresh_log_view("send"),
+        ).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Checkbutton(
+            top,
+            text="Exibir output bruto da toolkit (tempo real)",
+            variable=self.var_show_output,
+            command=lambda: self._refresh_log_view("send"),
+        ).grid(row=2, column=1, sticky="w", padx=6)
         btns = ttk.Frame(top)
-        btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        btns.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Button(btns, text="Iniciar Send", command=self._start_send).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancelar", command=self._cancel_current_job).pack(side="left", padx=4)
 
@@ -2296,6 +2368,30 @@ class App(tk.Tk):
         prog.pack(fill="x", padx=10, pady=8)
         ttk.Label(prog, textvariable=self.progress_items_var).pack(anchor="w")
         ttk.Label(prog, textvariable=self.progress_chunks_var).pack(anchor="w")
+        activity = ttk.Frame(self.tab_send, padding=(10, 0, 10, 4))
+        activity.pack(fill="x")
+        ttk.Label(activity, text="Atividade:").pack(side="left")
+        ttk.Label(activity, textvariable=self.activity_status_send).pack(side="left", padx=(6, 10))
+        self.pb_activity_send = ttk.Progressbar(
+            activity,
+            mode="indeterminate",
+            length=72,
+            style="Compact.Horizontal.TProgressbar",
+        )
+        self.pb_activity_send.pack(side="left")
+        self._activity_bars.append(self.pb_activity_send)
+        filter_bar = ttk.Frame(self.tab_send, padding=(10, 0, 10, 4))
+        filter_bar.pack(fill="x")
+        ttk.Label(filter_bar, text="Filtro de log (tela)").pack(side="left")
+        cmb_filter_send = ttk.Combobox(
+            filter_bar,
+            textvariable=self.var_log_filter_send,
+            values=self.log_filter_options,
+            width=18,
+            state="readonly",
+        )
+        cmb_filter_send.pack(side="left", padx=(8, 0))
+        cmb_filter_send.bind("<<ComboboxSelected>>", lambda _e: self._refresh_log_view("send"))
 
         log_frame = ttk.Frame(self.tab_send, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
@@ -2305,6 +2401,7 @@ class App(tk.Tk):
         y.pack(side="right", fill="y")
         self.txt_send.configure(yscrollcommand=y.set)
         self._setup_log_tags(self.txt_send)
+        self._log_widgets["send"] = self.txt_send
 
     def _build_validation_tab(self):
         top = ttk.Frame(self.tab_val, padding=10)
@@ -2326,6 +2423,30 @@ class App(tk.Tk):
             state="readonly",
         ).grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
         ttk.Button(top, text="Exportar relatorio completo", command=self._start_export_report).grid(row=1, column=3, padx=4, pady=(8, 0))
+        activity = ttk.Frame(self.tab_val, padding=(10, 0, 10, 4))
+        activity.pack(fill="x")
+        ttk.Label(activity, text="Atividade:").pack(side="left")
+        ttk.Label(activity, textvariable=self.activity_status_val).pack(side="left", padx=(6, 10))
+        self.pb_activity_val = ttk.Progressbar(
+            activity,
+            mode="indeterminate",
+            length=72,
+            style="Compact.Horizontal.TProgressbar",
+        )
+        self.pb_activity_val.pack(side="left")
+        self._activity_bars.append(self.pb_activity_val)
+        filter_bar = ttk.Frame(self.tab_val, padding=(10, 0, 10, 4))
+        filter_bar.pack(fill="x")
+        ttk.Label(filter_bar, text="Filtro de log (tela)").pack(side="left")
+        cmb_filter_val = ttk.Combobox(
+            filter_bar,
+            textvariable=self.var_log_filter_val,
+            values=self.log_filter_options,
+            width=18,
+            state="readonly",
+        )
+        cmb_filter_val.pack(side="left", padx=(8, 0))
+        cmb_filter_val.bind("<<ComboboxSelected>>", lambda _e: self._refresh_log_view("val"))
         log_frame = ttk.Frame(self.tab_val, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
         self.txt_val = tk.Text(log_frame, wrap="none")
@@ -2334,6 +2455,7 @@ class App(tk.Tk):
         y.pack(side="right", fill="y")
         self.txt_val.configure(yscrollcommand=y.set)
         self._setup_log_tags(self.txt_val)
+        self._log_widgets["val"] = self.txt_val
 
     def _build_runs_tab(self):
         root = ttk.Frame(self.tab_runs, padding=10)
@@ -2396,6 +2518,30 @@ class App(tk.Tk):
     def _worker_busy(self) -> bool:
         return self.worker_thread is not None and self.worker_thread.is_alive()
 
+    def _set_activity_context(self, context: str) -> None:
+        self._activity_context = (context or "").strip()
+
+    def _set_activity_running(self, running: bool) -> None:
+        if running:
+            status = f"processando ({self._activity_context})..." if self._activity_context else "processando..."
+        else:
+            status = "ocioso"
+        self.activity_status_an.set(status)
+        self.activity_status_send.set(status)
+        self.activity_status_val.set(status)
+
+        if running and not self._activity_running:
+            for bar in self._activity_bars:
+                bar.start(12)
+        elif not running and self._activity_running:
+            for bar in self._activity_bars:
+                bar.stop()
+            self._activity_context = ""
+        self._activity_running = running
+
+    def _sync_activity_indicator(self) -> None:
+        self._set_activity_running(self._worker_busy())
+
     def _browse_exam_root(self):
         p = filedialog.askdirectory(parent=self)
         if p:
@@ -2418,6 +2564,8 @@ class App(tk.Tk):
         self.cancel_event.clear()
         self._log_an("Iniciando analise...")
         self.analysis_progress_var.set("progresso analise: iniciando...")
+        self._set_activity_context("Analise")
+        self._set_activity_running(True)
 
         def task():
             try:
@@ -2455,13 +2603,21 @@ class App(tk.Tk):
         self.progress_items_var.set("enviando item 0 de 0")
         self.progress_chunks_var.set("batch chunk 0 de 0")
         show_output = bool(self.var_show_output.get())
+        self._set_activity_context("Send")
+        self._set_activity_running(True)
 
         def progress(items_done, items_total, chunk_no, chunk_total):
             self.queue.put(("send_progress", (items_done, items_total, chunk_no, chunk_total)))
 
         def task():
             try:
-                wf = SendWorkflow(self.config_obj, lambda m: self.queue.put(("send_log", m)), self.cancel_event, progress)
+                wf = SendWorkflow(
+                    self.config_obj,
+                    lambda m: self.queue.put(("send_log_internal", m)),
+                    self.cancel_event,
+                    progress,
+                    toolkit_logger=lambda m: self.queue.put(("send_log_toolkit", m)),
+                )
                 result = wf.run_send(run_id=run_id, batch_size=batch, show_output=show_output)
                 self.queue.put(("send_done", result))
             except Exception as ex:
@@ -2480,6 +2636,8 @@ class App(tk.Tk):
             return
         self.cancel_event.clear()
         self._log_val("[VAL_START] Iniciando validacao...")
+        self._set_activity_context("Validacao")
+        self._set_activity_running(True)
 
         def task():
             try:
@@ -2504,6 +2662,8 @@ class App(tk.Tk):
         mode = "A" if mode_label.upper().startswith("A") else "C"
         self.cancel_event.clear()
         self._log_val(f"[REPORT_START] Iniciando exportacao do relatorio completo (modo {mode})...")
+        self._set_activity_context("Exportacao de relatorio")
+        self._set_activity_running(True)
 
         def task():
             try:
@@ -2538,7 +2698,21 @@ class App(tk.Tk):
             return ""
         if any(tag in up for tag in ["[AN_END]", "[AN_RESULT]", "[SEND_RESULT]", "[VAL_END]", "[VAL_RESULT]", "[REPORT_EXPORT]"]):
             return "log_success"
-        if any(tag in up for tag in ["[AN_START]", "[SEND_CONFIG]", "[VAL_START]", "[CFG_SAVE]", "[SEND_PARSE_UID_EMPTY_EXPECTED]", "[REPORT_START]"]):
+        if any(
+            tag in up
+            for tag in [
+                "[AN_START]",
+                "[SEND_CONFIG]",
+                "[SEND_START]",
+                "[CHUNK_START]",
+                "[CHUNK_END]",
+                "[SEND_END]",
+                "[VAL_START]",
+                "[CFG_SAVE]",
+                "[SEND_PARSE_UID_EMPTY_EXPECTED]",
+                "[REPORT_START]",
+            ]
+        ):
             return "log_system"
         if "[ERRO]" in up or "[ERROR]" in up or "TRACEBACK" in up or "EXCEPTION" in up or "RUNTIMEERROR" in up:
             return "log_error"
@@ -2564,22 +2738,71 @@ class App(tk.Tk):
             return "log_system"
         return ""
 
-    def _append_log_line(self, widget: tk.Text, text: str) -> None:
-        tag = self._classify_log_tag(text)
+    def _log_filter_mode(self, panel: str) -> str:
+        if panel == "an":
+            return self.var_log_filter_an.get().strip() or "Todos"
+        if panel == "send":
+            return self.var_log_filter_send.get().strip() or "Todos"
+        if panel == "val":
+            return self.var_log_filter_val.get().strip() or "Todos"
+        return "Todos"
+
+    def _line_matches_filter(self, panel: str, tag: str, source: str) -> bool:
+        if panel == "send":
+            if source == "internal" and not bool(self.var_show_send_internal.get()):
+                return False
+            if source == "toolkit" and not bool(self.var_show_output.get()):
+                return False
+        mode = self._log_filter_mode(panel)
+        if mode == "Todos":
+            return True
+        if mode == "Sistema":
+            return tag == "log_system"
+        if mode == "Warnings + Erros":
+            return tag in ["log_warn", "log_error"]
+        return True
+
+    def _append_widget_line(self, widget: tk.Text, text: str, tag: str) -> None:
         if tag:
             widget.insert("end", text + "\n", tag)
         else:
             widget.insert("end", text + "\n")
+        line_count = int(widget.index("end-1c").split(".")[0])
+        if line_count > self._max_log_buffer_lines:
+            excess = line_count - self._max_log_buffer_lines
+            widget.delete("1.0", f"{excess + 1}.0")
         widget.see("end")
 
-    def _log_an(self, text: str):
-        self._append_log_line(self.txt_an, text)
+    def _refresh_log_view(self, panel: str) -> None:
+        widget = self._log_widgets.get(panel)
+        if widget is None:
+            return
+        widget.delete("1.0", "end")
+        for text, tag, source in self._log_buffers.get(panel, []):
+            if self._line_matches_filter(panel, tag, source):
+                self._append_widget_line(widget, text, tag)
 
-    def _log_send(self, text: str):
-        self._append_log_line(self.txt_send, text)
+    def _append_log_line(self, panel: str, text: str, source: str = "internal") -> None:
+        tag = self._classify_log_tag(text)
+        buf = self._log_buffers.setdefault(panel, [])
+        buf.append((text, tag, source))
+        if len(buf) > self._max_log_buffer_lines:
+            del buf[: len(buf) - self._max_log_buffer_lines]
+        if not self._line_matches_filter(panel, tag, source):
+            return
+        widget = self._log_widgets.get(panel)
+        if widget is None:
+            return
+        self._append_widget_line(widget, text, tag)
+
+    def _log_an(self, text: str):
+        self._append_log_line("an", text)
+
+    def _log_send(self, text: str, source: str = "internal"):
+        self._append_log_line("send", text, source=source)
 
     def _log_val(self, text: str):
-        self._append_log_line(self.txt_val, text)
+        self._append_log_line("val", text)
 
     def _human_size(self, value: int) -> str:
         n = float(value)
@@ -2598,7 +2821,11 @@ class App(tk.Tk):
                 elif event == "an_progress":
                     self.analysis_progress_var.set(payload)
                 elif event == "send_log":
-                    self._log_send(payload)
+                    self._log_send(payload, source="internal")
+                elif event == "send_log_internal":
+                    self._log_send(payload, source="internal")
+                elif event == "send_log_toolkit":
+                    self._log_send(payload, source="toolkit")
                 elif event == "val_log":
                     self._log_val(payload)
                 elif event == "an_done":
@@ -2659,6 +2886,7 @@ class App(tk.Tk):
                     messagebox.showerror("Erro na exportacao do relatorio", payload)
         except queue.Empty:
             pass
+        self._sync_activity_indicator()
         self.after(120, self._poll_queue)
 
 
