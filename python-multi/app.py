@@ -695,7 +695,7 @@ class AnalyzeWorkflow:
         force_all_files_for_folders = self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS"
         if force_all_files_for_folders:
             restrict_extensions = False
-        self._log(f"RUN_ID analise: {run}")
+        self._log(f"[AN_START] run_id={run} toolkit={self.cfg.toolkit} dcm4che_mode={dcm4che_send_mode}")
         self._log("Iniciando descoberta de arquivos...")
         if force_all_files_for_folders:
             self._log("[AN_FILTER_MODE] mode=all_files reason=dcm4che_folders include_no_extension=IGNORED")
@@ -933,9 +933,10 @@ class AnalyzeWorkflow:
         )
 
         self._log(
-            f"Analise concluida. arquivos={total_files} selecionados={selected_files} "
-            f"pastas_selecionadas={selected_folder_count} chunks={chunk_total} ({chunk_unit})."
+            f"[AN_RESULT] arquivos={total_files} selecionados={selected_files} "
+            f"pastas_selecionadas={selected_folder_count} chunks={chunk_total} ({chunk_unit})"
         )
+        self._log(f"[AN_END] run_id={run} status=PASS")
         self._progress(
             f"progresso analise: concluido | arquivos={total_files} selecionados={selected_files} "
             f"chunks={chunk_total}"
@@ -1125,6 +1126,14 @@ class SendWorkflow:
         sent_ok = 0
         warned = 0
         failed = 0
+        warn_type_counts: dict[str, int] = {
+            "SENT_UNKNOWN": 0,
+            "NON_DICOM": 0,
+            "UNSUPPORTED_DICOM_OBJECT": 0,
+            "UID_EMPTY_EXPECTED": 0,
+            "UID_EMPTY_UNEXPECTED": 0,
+            "PARSE_EXCEPTION": 0,
+        }
         interrupted = False
         item_cursor = done_files
         unit_cursor = done_units
@@ -1306,6 +1315,7 @@ class SendWorkflow:
                         sent_ok += 1
                     elif status in ["NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"]:
                         warned += 1
+                        warn_type_counts[status] = warn_type_counts.get(status, 0) + 1
                     else:
                         failed += 1
 
@@ -1341,12 +1351,21 @@ class SendWorkflow:
                             f"mode={dcm4che_send_mode} status={status} extract_status={extract_status}"
                         )
                     elif not src_iuid:
-                        self._log(
-                            f"[SEND_PARSE_UID_EMPTY] file={fp} mode={dcm4che_send_mode} "
-                            f"status={status} extract_status={extract_status}"
-                        )
+                        if Path(fp).name.upper() == "DICOMDIR":
+                            warn_type_counts["UID_EMPTY_EXPECTED"] = warn_type_counts.get("UID_EMPTY_EXPECTED", 0) + 1
+                            self._log(
+                                f"[SEND_PARSE_UID_EMPTY_EXPECTED] file={fp} mode={dcm4che_send_mode} "
+                                f"status={status} extract_status={extract_status}"
+                            )
+                        else:
+                            warn_type_counts["UID_EMPTY_UNEXPECTED"] = warn_type_counts.get("UID_EMPTY_UNEXPECTED", 0) + 1
+                            self._log(
+                                f"[SEND_PARSE_UID_EMPTY] file={fp} mode={dcm4che_send_mode} "
+                                f"status={status} extract_status={extract_status}"
+                            )
                     parse_notes = parse_exception_by_file.get(fp, [])
                     if parse_notes:
+                        warn_type_counts["PARSE_EXCEPTION"] = warn_type_counts.get("PARSE_EXCEPTION", 0) + 1
                         write_telemetry_event(
                             events,
                             run,
@@ -1382,6 +1401,7 @@ class SendWorkflow:
                         sent_ok += 1
                     elif status in ["NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"]:
                         warned += 1
+                        warn_type_counts[status] = warn_type_counts.get(status, 0) + 1
                     else:
                         failed += 1
 
@@ -1410,6 +1430,16 @@ class SendWorkflow:
                             "SEND_FILE_ERROR",
                             detail or status,
                             f"chunk_no={chunk_index};file_path={fp};error_type={status}",
+                        )
+                    parse_notes = parse_exception_by_file.get(fp, [])
+                    if parse_notes:
+                        warn_type_counts["PARSE_EXCEPTION"] = warn_type_counts.get("PARSE_EXCEPTION", 0) + 1
+                        write_telemetry_event(
+                            events,
+                            run,
+                            "SEND_PARSE_EXCEPTION",
+                            parse_notes[0],
+                            f"chunk_no={chunk_index};file_path={fp};errors={len(parse_notes)}",
                         )
                     self.progress_callback(item_cursor, total_items, chunk_index, total_chunks)
             unit_cursor += len(batch_inputs)
@@ -1447,7 +1477,17 @@ class SendWorkflow:
             ["run_id", "toolkit", "ts_mode_effective", "total_items", "items_processed", "sent_ok", "warnings", "failed", "status", "finished_at"],
         )
         write_telemetry_event(events, run, "RUN_SEND_END", "Envio finalizado.", f"status={final_status}")
-        self._log(f"Resumo envio: ok={sent_ok} warn={warned} fail={failed} status={final_status}")
+        self._log(f"[SEND_RESULT] ok={sent_ok} warn={warned} fail={failed} status={final_status}")
+        if warned > 0:
+            self._log(
+                "[SEND_WARN_SUMMARY] "
+                f"sent_unknown={warn_type_counts.get('SENT_UNKNOWN', 0)} "
+                f"non_dicom={warn_type_counts.get('NON_DICOM', 0)} "
+                f"unsupported={warn_type_counts.get('UNSUPPORTED_DICOM_OBJECT', 0)} "
+                f"uid_empty_expected={warn_type_counts.get('UID_EMPTY_EXPECTED', 0)} "
+                f"uid_empty_unexpected={warn_type_counts.get('UID_EMPTY_UNEXPECTED', 0)} "
+                f"parse_exception_files={warn_type_counts.get('PARSE_EXCEPTION', 0)}"
+            )
         return {"run_id": run, "status": final_status, "run_dir": str(run_dir)}
 
 
@@ -1745,9 +1785,9 @@ class ValidationWorkflow:
         send_ok_files = sum(1 for r in send_rows if r.get("send_status", "") == "SENT_OK")
         send_warn_files = sum(1 for r in send_rows if r.get("send_status", "") in ["NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"])
         send_fail_files = sum(1 for r in send_rows if r.get("send_status", "") == "SEND_FAIL")
-        self._log(f"Validacao do run: {run}")
+        self._log(f"[VAL_START] run_id={run}")
         self._log(
-            f"Resumo send para validacao: total={total_send_rows} sent_ok={send_ok_files} "
+            f"[VAL_RESULT] send_total={total_send_rows} sent_ok={send_ok_files} "
             f"warn={send_warn_files} fail={send_fail_files}"
         )
         self._log(f"Mapeamentos IUID atuais (send_results+fallback legado): {len(map_by_file)}")
@@ -1914,7 +1954,7 @@ class ValidationWorkflow:
             },
             ["run_id", "toolkit", "total_iuid_unique", "iuid_ok", "iuid_not_found", "iuid_api_error", "send_warning_files", "send_failed_files", "final_status", "generated_at"],
         )
-        self._log("--- Resumo Final Validacao ---")
+        self._log("[VAL_RESULT] --- Resumo Final Validacao ---")
         self._log(f"Run ID: {run}")
         self._log(f"Arquivos do send: {total_send_rows}")
         self._log(f"Arquivos SENT_OK: {send_ok_files}")
@@ -1924,7 +1964,7 @@ class ValidationWorkflow:
         self._log(f"IUIDs OK: {ok_count}")
         self._log(f"IUIDs NOT_FOUND: {miss_count}")
         self._log(f"IUIDs API_ERROR: {api_err_count}")
-        self._log(f"Status final: {final_status}")
+        self._log(f"[VAL_END] run_id={run} status={final_status}")
         write_telemetry_event(
             events,
             run,
@@ -2439,7 +2479,7 @@ class App(tk.Tk):
             messagebox.showerror("Erro", "Informe run_id.")
             return
         self.cancel_event.clear()
-        self._log_val("Iniciando validacao...")
+        self._log_val("[VAL_START] Iniciando validacao...")
 
         def task():
             try:
@@ -2463,7 +2503,7 @@ class App(tk.Tk):
         mode_label = self.var_report_mode.get().strip()
         mode = "A" if mode_label.upper().startswith("A") else "C"
         self.cancel_event.clear()
-        self._log_val(f"Iniciando exportacao do relatorio completo (modo {mode})...")
+        self._log_val(f"[REPORT_START] Iniciando exportacao do relatorio completo (modo {mode})...")
 
         def task():
             try:
@@ -2487,15 +2527,19 @@ class App(tk.Tk):
     def _setup_log_tags(self, widget: tk.Text) -> None:
         # Visual-only highlighting in UI. Raw log files remain plain text.
         widget.tag_configure("log_error", foreground="#b00020")
-        widget.tag_configure("log_warn", foreground="#9a6700")
-        widget.tag_configure("log_success", foreground="#1f883d")
-        widget.tag_configure("log_system", foreground="#1f6feb")
+        widget.tag_configure("log_warn", foreground="#8a4b00")
+        widget.tag_configure("log_success", foreground="#146c2e")
+        widget.tag_configure("log_system", foreground="#0052cc")
 
     def _classify_log_tag(self, text: str) -> str:
         line = (text or "").strip()
         up = line.upper()
         if not line:
             return ""
+        if any(tag in up for tag in ["[AN_END]", "[AN_RESULT]", "[SEND_RESULT]", "[VAL_END]", "[VAL_RESULT]", "[REPORT_EXPORT]"]):
+            return "log_success"
+        if any(tag in up for tag in ["[AN_START]", "[SEND_CONFIG]", "[VAL_START]", "[CFG_SAVE]", "[SEND_PARSE_UID_EMPTY_EXPECTED]", "[REPORT_START]"]):
+            return "log_system"
         if "[ERRO]" in up or "[ERROR]" in up or "TRACEBACK" in up or "EXCEPTION" in up or "RUNTIMEERROR" in up:
             return "log_error"
         if (
@@ -2503,6 +2547,7 @@ class App(tk.Tk):
             or " WARN " in up
             or "PASS_WITH_WARNINGS" in up
             or "SEND_PARSE_" in up
+            or "[SEND_WARN_SUMMARY]" in up
             or "SENT_UNKNOWN" in up
         ):
             return "log_warn"
@@ -2586,7 +2631,7 @@ class App(tk.Tk):
                         self._log_send(f"SEND finalizado. Run ID: {payload.get('run_id')} | Status: {status}")
                     self._refresh_run_list()
                 elif event == "val_done":
-                    self._log_val(f"VALIDACAO finalizada. Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
+                    self._log_val(f"[VAL_END] Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
                     self._refresh_run_list()
                 elif event == "report_done":
                     self._log_val(
