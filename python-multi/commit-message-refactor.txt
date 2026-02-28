@@ -1,0 +1,9 @@
+refactor(python-multi): migrar app monólito para arquitetura modular
+
+- Extrair config (AppConfig), domain (constantes/regex), shared (utils),
+  infra (run_artifacts CSV/paths), integrations (toolkit_drivers).
+- Extrair workflows: analyze, send, validation para app/workflows/.
+- Extrair UI: ConfigDialog e App para app/ui/ (config_dialog, app_window).
+- Reduzir app.py a entrypoint mínimo (import App + mainloop).
+- Atualizar README com seção de arquitetura modular.
+- Manter paridade funcional (mesmos artefatos, paths e comportamento).
