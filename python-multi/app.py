@@ -37,6 +37,9 @@ DCM4CHE_STORE_RSP_ERR_RE = re.compile(
 DCMTK_SENDING_FILE_RE = re.compile(r"I:\s+Sending file:\s+(.+)$")
 DCMTK_BAD_FILE_RE = re.compile(r"E:\s+Bad DICOM file:\s+(.+?):\s*(.+)$")
 DCMTK_STORE_RSP_RE = re.compile(r"I:\s+Received Store Response\s+\((.+)\)$")
+DCMTK_NO_SOP_UID_RE = re.compile(r"E:\s+No SOP Class or Instance UID in file:\s+(.+)$")
+DCMTK_STORE_FAILED_FILE_RE = re.compile(r"E:\s+Store Failed,\s*file:\s+(.+?):\s*$")
+DCMTK_STORE_FAILED_REASON_RE = re.compile(r"E:\s+([0-9A-F]{4}:[0-9A-F]{4}\s+.+)$", re.IGNORECASE)
 UID_TAG_0008_0018 = re.compile(r"\(0008,0018\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
 UID_TAG_0002_0010 = re.compile(r"\(0002,0010\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
 UID_VALUE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)+")
@@ -44,6 +47,12 @@ IS_WINDOWS = os.name == "nt"
 WINDOWS_CMD_SAFE_MAX_CHARS = 7600
 WINDOWS_DIRECT_SAFE_MAX_CHARS = 30000
 DCM4CHE_JAVA_MAIN_CLASS = "org.dcm4che3.tool.storescu.StoreSCU"
+DCM4CHE_CRITICAL_JAR_MARKERS = [
+    "dcm4che-tool-storescu",
+    "dcm4che-tool-common",
+    "dcm4che-net",
+    "dcm4che-core",
+]
 
 
 def hidden_process_kwargs() -> dict:
@@ -75,6 +84,7 @@ class AppConfig:
     collect_size_bytes: bool = False
     ts_mode: str = "AUTO"
     dcm4che_send_mode: str = "MANIFEST_FILES"
+    dcm4che_iuid_update_mode: str = "REALTIME"
     # Prefer direct Java launcher with @argfile on Windows to avoid cmd line-length bottlenecks.
     dcm4che_prefer_java_direct: bool = True
     # Internal flag: keep Windows-stable wrapper for .bat execution by default.
@@ -193,6 +203,12 @@ def sanitize_uid(value: str) -> str:
     return m.group(0).strip() if m else ""
 
 
+def normalize_uid_candidate(value: str) -> str:
+    # dcmdump outputs can contain wrapped UID text; normalize before extracting.
+    compact = re.sub(r"\s+", "", (value or "").strip())
+    return sanitize_uid(compact)
+
+
 def looks_like_dicom_payload_file(file_path: Path) -> bool:
     name_up = file_path.name.upper()
     if name_up == "DICOMDIR":
@@ -210,6 +226,13 @@ def normalize_dcm4che_send_mode(mode: str) -> str:
     if m in ["FILES", "MANIFEST_FILES"]:
         return "MANIFEST_FILES"
     return "FOLDERS"
+
+
+def normalize_dcm4che_iuid_update_mode(mode: str) -> str:
+    m = (mode or "").strip().upper()
+    if m in ["CHUNK_END", "CHUNK", "BATCH"]:
+        return "CHUNK_END"
+    return "REALTIME"
 
 
 def toolkit_run_suffix(toolkit: str, dcm4che_send_mode: str = "MANIFEST_FILES") -> str:
@@ -626,8 +649,8 @@ class Dcm4cheDriver(ToolkitDriver):
         out = self.dcmdump_text(["cmd", "/c", str(dcmdump), str(file_path)])
         iuid_m = UID_TAG_0008_0018.search(out)
         ts_m = UID_TAG_0002_0010.search(out)
-        iuid = sanitize_uid(iuid_m.group(1) if iuid_m else "")
-        ts_uid = sanitize_uid(ts_m.group(1) if ts_m else "")
+        iuid = normalize_uid_candidate(iuid_m.group(1) if iuid_m else "")
+        ts_uid = normalize_uid_candidate(ts_m.group(1) if ts_m else "")
         return iuid, ts_uid, ts_uid, ""
 
     def parse_send_output(self, lines: list[str], batch_files: list[Path]) -> dict[str, dict]:
@@ -692,24 +715,58 @@ class DcmtkDriver(ToolkitDriver):
         out = self.dcmdump_text([str(dcmdump), "+P", "0008,0018", "+P", "0002,0010", str(file_path)])
         iuid_m = UID_TAG_0008_0018.search(out)
         ts_m = UID_TAG_0002_0010.search(out)
-        iuid = iuid_m.group(1).strip() if iuid_m else ""
-        ts_uid = ts_m.group(1).strip() if ts_m else ""
+        iuid = normalize_uid_candidate(iuid_m.group(1) if iuid_m else "")
+        ts_uid = normalize_uid_candidate(ts_m.group(1) if ts_m else "")
         return iuid, ts_uid, ts_uid, ""
 
     def parse_send_output(self, lines: list[str], batch_files: list[Path]) -> dict[str, dict]:
         result: dict[str, dict] = {}
         current_file = ""
+        pending_failed_file = ""
         for line in lines:
             m_file = DCMTK_SENDING_FILE_RE.search(line)
             if m_file:
                 current_file = m_file.group(1).strip()
-                result.setdefault(current_file, {"send_status": "SENT_UNKNOWN", "status_detail": ""})
+                result.setdefault(
+                    current_file,
+                    {"send_status": "SENT_UNKNOWN", "status_detail": "File sending initiated; awaiting response"},
+                )
+                pending_failed_file = ""
                 continue
             m_bad = DCMTK_BAD_FILE_RE.search(line)
             if m_bad:
                 bad_file = m_bad.group(1).strip()
                 detail = m_bad.group(2).strip()
                 result[bad_file] = {"send_status": "NON_DICOM", "status_detail": detail}
+                pending_failed_file = ""
+                continue
+            m_no_sop = DCMTK_NO_SOP_UID_RE.search(line)
+            if m_no_sop:
+                bad_file = m_no_sop.group(1).strip()
+                result[bad_file] = {
+                    "send_status": "SENT_UNKNOWN",
+                    "status_detail": "No SOP Class or Instance UID in file",
+                }
+                pending_failed_file = ""
+                current_file = bad_file
+                continue
+            m_failed_file = DCMTK_STORE_FAILED_FILE_RE.search(line)
+            if m_failed_file:
+                pending_failed_file = m_failed_file.group(1).strip()
+                result[pending_failed_file] = {
+                    "send_status": "SENT_UNKNOWN",
+                    "status_detail": "Store failed; awaiting reason line",
+                }
+                current_file = pending_failed_file
+                continue
+            m_failed_reason = DCMTK_STORE_FAILED_REASON_RE.search(line)
+            if m_failed_reason and pending_failed_file:
+                detail = m_failed_reason.group(1).strip()
+                result[pending_failed_file] = {
+                    "send_status": "SENT_UNKNOWN",
+                    "status_detail": detail,
+                }
+                pending_failed_file = ""
                 continue
             m_rsp = DCMTK_STORE_RSP_RE.search(line)
             if m_rsp and current_file:
@@ -718,9 +775,16 @@ class DcmtkDriver(ToolkitDriver):
                 if ("Unknown Status: 0x110" in detail) and Path(current_file).name.upper() == "DICOMDIR":
                     status = "UNSUPPORTED_DICOM_OBJECT"
                 result[current_file] = {"send_status": status, "status_detail": detail}
+                pending_failed_file = ""
         for p in batch_files:
             k = str(p)
-            result.setdefault(k, {"send_status": "SENT_UNKNOWN", "status_detail": ""})
+            result.setdefault(
+                k,
+                {
+                    "send_status": "SENT_UNKNOWN",
+                    "status_detail": "parse_status=UNKNOWN;reason=no_match_in_output",
+                },
+            )
         return result
 
 
@@ -1200,6 +1264,21 @@ class SendWorkflow:
                 f.write(f"{_java_argfile_token(token)}\n")
         return [java_exec, f"@{java_args_file}"], java_args_file
 
+    def _check_dcm4che_java_dependencies(self) -> tuple[bool, list[str], Path]:
+        storescu = self._dcm4che_storescu_bat_path()
+        dcm4che_root = storescu.parent.parent
+        lib_dir = dcm4che_root / "lib"
+        if not lib_dir.exists():
+            return False, [f"lib_dir_not_found:{lib_dir}"], lib_dir
+
+        jar_names = [x.name.lower() for x in lib_dir.glob("*.jar")]
+        missing: list[str] = []
+        for marker in DCM4CHE_CRITICAL_JAR_MARKERS:
+            marker_l = marker.lower()
+            if not any(marker_l in jar for jar in jar_names):
+                missing.append(marker)
+        return len(missing) == 0, missing, lib_dir
+
     def _write_chunk_command_trace(
         self,
         *,
@@ -1248,26 +1327,28 @@ class SendWorkflow:
             self._log(f"[WARN] TS mode '{ts_mode}' ainda nao implementado. Usando AUTO.")
             ts_mode = "AUTO"
         dcm4che_send_mode = normalize_dcm4che_send_mode(self.cfg.dcm4che_send_mode)
+        dcm4che_iuid_update_mode = normalize_dcm4che_iuid_update_mode(self.cfg.dcm4che_iuid_update_mode)
         dcm4che_exec_mode = "N/A"
         dcm4che_exec_reason = "N/A"
         dcm4che_java_exec = ""
         if self.cfg.toolkit == "dcm4che":
-            if IS_WINDOWS and self.cfg.dcm4che_prefer_java_direct:
-                dcm4che_java_exec, java_reason = resolve_java_executable()
-                if dcm4che_java_exec:
-                    dcm4che_exec_mode = "JAVA_DIRECT"
-                    dcm4che_exec_reason = f"java={dcm4che_java_exec}"
-                else:
-                    dcm4che_exec_mode = "CMD_BAT"
-                    dcm4che_exec_reason = f"java_unavailable={java_reason}"
-            else:
-                dcm4che_exec_mode = "CMD_BAT"
-                dcm4che_exec_reason = "java_direct_disabled_or_non_windows"
-            if dcm4che_exec_mode == "CMD_BAT" and not self.cfg.dcm4che_use_shell_wrapper:
-                self._log("[WARN] dcm4che sem wrapper de shell ativo (modo experimental).")
+            if not self.cfg.dcm4che_prefer_java_direct:
+                self._log(
+                    "[WARN] dcm4che_prefer_java_direct=OFF ignorado: JAVA_DIRECT agora e obrigatorio para envio."
+                )
+            dcm4che_java_exec, java_reason = resolve_java_executable()
+            if not dcm4che_java_exec:
+                self._log(f"[SEND_EXEC_MODE] toolkit=dcm4che mode=JAVA_DIRECT reason=java_unavailable:{java_reason}")
+                raise RuntimeError(
+                    "JAVA_DIRECT obrigatorio para dcm4che, mas o Java nao esta funcional "
+                    f"(motivo: {java_reason}). Instale/ajuste Java 17 e tente novamente."
+                )
+            dcm4che_exec_mode = "JAVA_DIRECT"
+            dcm4che_exec_reason = f"java={dcm4che_java_exec}"
         self._log(
             f"[SEND_CONFIG] toolkit={self.cfg.toolkit} "
             f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
+            f"dcm4che_iuid_update_mode={dcm4che_iuid_update_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
             f"dcm4che_exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
             f"dcm4che_exec_reason={dcm4che_exec_reason if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
         )
@@ -1282,6 +1363,7 @@ class SendWorkflow:
         total_items = len(selected)
         if total_items == 0:
             raise RuntimeError("Nenhum arquivo selecionado no manifesto para envio.")
+        send_unit_is_file_mode = not (self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS")
         folder_to_files: dict[str, list[Path]] = {}
         for r in selected_rows:
             folder = str(r.get("folder_path", "")).strip() or str(Path(r["file_path"]).parent)
@@ -1289,6 +1371,8 @@ class SendWorkflow:
 
         checkpoint_name = send_checkpoint_filename(self.cfg)
         checkpoint_read = resolve_run_artifact_path(run_dir, checkpoint_name, for_write=False, logger=self._log)
+        send_results_read = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=False, logger=self._log)
+        send_summary_read = resolve_run_artifact_path(run_dir, "send_summary.csv", for_write=False, logger=self._log)
 
         done_units = 0
         done_files = 0
@@ -1301,7 +1385,41 @@ class SendWorkflow:
                 done_units = 0
                 done_files = 0
 
-        if done_units == 0:
+        done_units = max(done_units, 0)
+        done_files = max(done_files, 0)
+
+        processed_files_from_results: set[str] = set()
+        existing_send_chunk_max = 0
+        if send_results_read.exists():
+            try:
+                for rr in read_csv_rows(send_results_read):
+                    fp = str(rr.get("file_path", "")).strip()
+                    if fp:
+                        processed_files_from_results.add(fp)
+                    chunk_no_raw = str(rr.get("chunk_no", "")).strip()
+                    if chunk_no_raw:
+                        try:
+                            existing_send_chunk_max = max(existing_send_chunk_max, int(chunk_no_raw))
+                        except Exception:
+                            pass
+            except Exception:
+                processed_files_from_results = set()
+                existing_send_chunk_max = 0
+        selected_file_set = {str(x) for x in selected}
+        done_files_from_results = sum(1 for fp in selected_file_set if fp in processed_files_from_results)
+        if send_unit_is_file_mode and done_files_from_results > done_files:
+            self._log(
+                f"[SEND_RESUME_FROM_RESULTS] done_files_checkpoint={done_files} done_files_results={done_files_from_results}"
+            )
+            done_files = done_files_from_results
+        elif (not send_unit_is_file_mode) and done_files_from_results > 0:
+            self._log(
+                "[WARN] Resume por send_results_by_file ignora modo FOLDERS; cursor segue checkpoint por unidade."
+            )
+        done_files = min(done_files, total_items)
+        is_resuming = (done_units > 0) or (send_unit_is_file_mode and done_files > 0)
+
+        if not is_resuming:
             for filename in [
                 "storescu_execucao.log",
                 "send_results_by_file.csv",
@@ -1311,6 +1429,12 @@ class SendWorkflow:
             for legacy_name in ["analysis_events.csv", "send_events.csv", "send_errors.csv", "consistency_events.csv"]:
                 cleanup_run_artifact_variants(run_dir, legacy_name)
             self._log(f"RUN_ID envio: {run}")
+        else:
+            self._log(
+                f"[SEND_RESUME_STATE] done_units={done_units} done_files={done_files} "
+                f"send_unit_mode={'FILES' if send_unit_is_file_mode else 'FOLDERS'} "
+                f"prev_chunk_max={existing_send_chunk_max}"
+            )
 
         log_file = resolve_run_artifact_path(run_dir, "storescu_execucao.log", for_write=True, logger=self._log)
         events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
@@ -1319,7 +1443,7 @@ class SendWorkflow:
         checkpoint = resolve_run_artifact_path(run_dir, checkpoint_name, for_write=True, logger=self._log)
         args_dir = resolve_run_batch_args_dir(run_dir, for_write=True, logger=self._log)
         chunk_cmd_dir = run_dir / RUN_SUBDIR_TELEMETRY / "chunk_commands"
-        if done_units == 0 and chunk_cmd_dir.exists():
+        if not is_resuming and chunk_cmd_dir.exists():
             for fp in chunk_cmd_dir.glob("*"):
                 if fp.is_file():
                     fp.unlink()
@@ -1336,6 +1460,35 @@ class SendWorkflow:
                 "Modo de execucao do envio definido.",
                 f"toolkit=dcm4che;mode={dcm4che_exec_mode};reason={dcm4che_exec_reason}",
             )
+            jars_ok, missing_jars, jar_lib_dir = self._check_dcm4che_java_dependencies()
+            if jars_ok:
+                self._log(
+                    f"[JAVA_HEALTHCHECK] status=OK lib={jar_lib_dir} "
+                    f"critical_markers={','.join(DCM4CHE_CRITICAL_JAR_MARKERS)}"
+                )
+                write_telemetry_event(
+                    events,
+                    run,
+                    "RUN_SEND_JAVA_HEALTHCHECK",
+                    "Dependencias Java criticas validadas.",
+                    f"status=OK;lib={jar_lib_dir}",
+                )
+            else:
+                miss = ",".join(missing_jars)
+                self._log(
+                    f"[JAVA_HEALTHCHECK] status=FAIL lib={jar_lib_dir} missing={miss}"
+                )
+                write_telemetry_event(
+                    events,
+                    run,
+                    "RUN_SEND_JAVA_HEALTHCHECK",
+                    "Dependencias Java criticas ausentes.",
+                    f"status=FAIL;lib={jar_lib_dir};missing={miss}",
+                )
+                raise RuntimeError(
+                    "Falha no health-check Java da toolkit dcm4che. "
+                    f"JARs criticos ausentes: {miss}. Verifique a pasta {jar_lib_dir}."
+                )
 
         if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
             manifest_folders = resolve_run_artifact_path(run_dir, "manifest_folders.csv", for_write=False, logger=self._log)
@@ -1352,12 +1505,17 @@ class SendWorkflow:
             raw_chunks = [ordered_folders[i : i + batch_size] for i in range(done_units, units_total, batch_size)]
         else:
             units_total = total_items
-            raw_chunks = [selected[i : i + batch_size] for i in range(done_units, units_total, batch_size)]
+            pending_selected = [x for x in selected if str(x) not in processed_files_from_results]
+            raw_chunks = [pending_selected[i : i + batch_size] for i in range(0, len(pending_selected), batch_size)]
+        pending_items = len(raw_chunks) * batch_size if (self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS") else sum(
+            len(x) for x in raw_chunks
+        )
 
-        if units_total > 0 and done_units >= units_total:
+        is_already_completed = (units_total > 0 and done_units >= units_total) if not send_unit_is_file_mode else (len(raw_chunks) == 0)
+        if is_already_completed:
             prev_status = ""
-            if send_summary.exists():
-                prev_rows = read_csv_rows(send_summary)
+            if send_summary_read.exists():
+                prev_rows = read_csv_rows(send_summary_read)
                 if prev_rows:
                     prev_status = str(prev_rows[-1].get("status", "")).strip()
             if prev_status == "PASS":
@@ -1370,7 +1528,24 @@ class SendWorkflow:
             write_telemetry_event(events, run, "RUN_SEND_SKIP_ALREADY_COMPLETED", msg, f"prev_status={prev_status or 'N/A'}")
             return {"run_id": run, "status": status, "run_dir": str(run_dir)}
 
-        chunk_start_index = (done_units // batch_size) + 1
+        chunk_start_index = (existing_send_chunk_max + 1) if is_resuming else 1
+        if is_resuming:
+            write_telemetry_event(
+                events,
+                run,
+                "RUN_SEND_RESUME",
+                "Retomada de envio detectada.",
+                (
+                    f"done_files={done_files};done_units={done_units};pending_items={pending_items};"
+                    f"pending_chunks={len(raw_chunks)};chunk_start_index={chunk_start_index};"
+                    f"send_unit_mode={'FILES' if send_unit_is_file_mode else 'FOLDERS'}"
+                ),
+            )
+            self._log(
+                f"[SEND_RESUME] done_files={done_files} done_units={done_units} "
+                f"pending_items={pending_items} pending_chunks={len(raw_chunks)} "
+                f"chunk_start_index={chunk_start_index}"
+            )
         prepared_chunks: list[tuple[list[Path], list[Path], int, int, int]] = []
         for original_chunk_no, batch in enumerate(raw_chunks, start=chunk_start_index):
             if self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS":
@@ -1442,12 +1617,14 @@ class SendWorkflow:
             (
                 f"total_items={total_items};batch={batch_size};toolkit={self.cfg.toolkit};"
                 f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'};"
+                f"dcm4che_iuid_update_mode={dcm4che_iuid_update_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'};"
                 f"dcm4che_exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
             ),
         )
         self._log(
             f"[SEND_START] total_items={total_items} batch={batch_size} "
             f"toolkit={self.cfg.toolkit} mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
+            f"iuid_mode={dcm4che_iuid_update_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
             f"exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
         )
 
@@ -1466,15 +1643,48 @@ class SendWorkflow:
         item_cursor = done_files
         unit_cursor = done_units
 
+        def _write_send_checkpoint(reason: str, file_path: str = "") -> None:
+            checkpoint_done_units = item_cursor if send_unit_is_file_mode else unit_cursor
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        "run_id": run,
+                        "done_units": checkpoint_done_units,
+                        "done_files": item_cursor,
+                        "updated_at": now_br(),
+                        "checkpoint_mode": "ITEM",
+                        "checkpoint_reason": reason,
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            if reason == "ITEM":
+                self._log(
+                    f"[SEND_CHECKPOINT_ITEM] processed_items={item_cursor}/{total_items} "
+                    f"done_units={checkpoint_done_units} file={file_path or 'N/A'}"
+                )
+
+        attempt_chunks_total = len(prepared_chunks)
         for chunk_index, (batch_inputs, batch_files, original_chunk_no, split_pos, split_total) in enumerate(
             prepared_chunks, start=chunk_start_index
         ):
             if self.cancel_event.is_set():
                 interrupted = True
                 break
+            attempt_chunk_no = (chunk_index - chunk_start_index) + 1
+            batch_file_set = {str(x) for x in batch_files}
             first_item = item_cursor + 1
             last_item = min(item_cursor + len(batch_files), total_items)
-            self.progress_callback(first_item, total_items, chunk_index, total_chunks)
+            self.progress_callback(
+                first_item,
+                total_items,
+                attempt_chunk_no,
+                attempt_chunks_total,
+                chunk_index,
+                total_chunks,
+            )
             split_info = ""
             if split_total > 1:
                 split_info = f" split={split_pos}/{split_total} origin={original_chunk_no}"
@@ -1571,6 +1781,284 @@ class SendWorkflow:
 
             lines: list[str] = []
             exit_code = -1
+            realtime_iuid_enabled = (
+                self.cfg.toolkit == "dcm4che" and dcm4che_iuid_update_mode == "REALTIME"
+            )
+            dcmtk_realtime_enabled = self.cfg.toolkit == "dcmtk"
+            realtime_written_files: set[str] = set()
+            dcmtk_written_files: set[str] = set()
+            dcmtk_current_file = ""
+            realtime_payload_files = [str(x) for x in batch_files if looks_like_dicom_payload_file(x)]
+            realtime_payload_cursor = 0
+            realtime_file_by_iuid: dict[str, str] = {}
+            realtime_seen_rq_iuids: set[str] = set()
+            realtime_seen_rsp_ok_iuids: set[str] = set()
+            realtime_seen_rsp_err_iuids: set[str] = set()
+            realtime_stream_buffer = ""
+            realtime_stream_buffer_max_chars = 200000
+            warning_statuses = {"NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"}
+
+            def _write_realtime_iuid_row(
+                *,
+                file_path_s: str,
+                iuid_value: str,
+                status_value: str,
+                extract_status_value: str,
+                detail_suffix: str,
+            ) -> None:
+                nonlocal item_cursor, sent_ok, warned, failed
+                if file_path_s in realtime_written_files:
+                    return
+                src_iuid = ""
+                src_ts_uid = ""
+                src_ts_name = ""
+                meta_err = ""
+                try:
+                    src_iuid, src_ts_uid, src_ts_name, meta_err = self.driver.extract_metadata(self.cfg, Path(file_path_s))
+                except Exception as ex:
+                    meta_err = str(ex)
+                src_iuid = sanitize_uid(src_iuid)
+                src_ts_uid = sanitize_uid(src_ts_uid)
+                src_ts_name = sanitize_uid(src_ts_name)
+                observed_iuid = sanitize_uid(iuid_value)
+                if observed_iuid:
+                    row_iuid = observed_iuid
+                elif src_iuid:
+                    row_iuid = src_iuid
+                else:
+                    row_iuid = sanitize_uid(Path(file_path_s).name)
+
+                detail = f"dcm4che realtime_iuid=ON;{detail_suffix}"
+                if meta_err:
+                    detail += f";meta_err={meta_err}"
+
+                write_csv_row(
+                    send_results,
+                    {
+                        "run_id": run,
+                        "file_path": file_path_s,
+                        "chunk_no": chunk_index,
+                        "toolkit": self.cfg.toolkit,
+                        "ts_mode": ts_mode,
+                        "send_status": status_value,
+                        "status_detail": detail,
+                        "sop_instance_uid": row_iuid,
+                        "source_ts_uid": src_ts_uid,
+                        "source_ts_name": src_ts_name,
+                        "extract_status": extract_status_value,
+                        "processed_at": now_br(),
+                    },
+                    result_fields,
+                )
+
+                if status_value == "SENT_OK":
+                    sent_ok += 1
+                elif status_value in ["NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"]:
+                    warned += 1
+                    warn_type_counts[status_value] = warn_type_counts.get(status_value, 0) + 1
+                else:
+                    failed += 1
+
+                if status_value != "SENT_OK":
+                    write_telemetry_event(
+                        events,
+                        run,
+                        "SEND_FILE_ERROR",
+                        detail or status_value,
+                        f"chunk_no={chunk_index};file_path={file_path_s};error_type={status_value}",
+                    )
+
+                write_telemetry_event(
+                    events,
+                    run,
+                    "SEND_IUID_REALTIME",
+                    "IUID registrado em tempo real.",
+                    f"chunk_no={chunk_index};file_path={file_path_s};iuid={row_iuid};status={status_value}",
+                )
+                self._log(
+                    f"[SEND_IUID_REALTIME] chunk={chunk_index}/{total_chunks} status={status_value} "
+                    f"iuid={row_iuid} file={file_path_s}"
+                )
+                realtime_written_files.add(file_path_s)
+                item_cursor += 1
+                self.progress_callback(
+                    item_cursor,
+                    total_items,
+                    attempt_chunk_no,
+                    attempt_chunks_total,
+                    chunk_index,
+                    total_chunks,
+                )
+                _write_send_checkpoint("ITEM", file_path_s)
+
+            def _process_realtime_stream_line(clean: str) -> None:
+                nonlocal realtime_payload_cursor, realtime_stream_buffer
+                if not (
+                    ("C-STORE-" in clean)
+                    or ("iuid=" in clean)
+                    or ("status=" in clean)
+                ):
+                    return
+                realtime_stream_buffer += clean + "\n"
+                if len(realtime_stream_buffer) > realtime_stream_buffer_max_chars:
+                    realtime_stream_buffer = realtime_stream_buffer[-realtime_stream_buffer_max_chars:]
+
+                for m_rq in DCM4CHE_STORE_RQ_RE.finditer(realtime_stream_buffer):
+                    rq_iuid = sanitize_uid(m_rq.group(1))
+                    if not rq_iuid or rq_iuid in realtime_seen_rq_iuids:
+                        continue
+                    realtime_seen_rq_iuids.add(rq_iuid)
+                    if rq_iuid not in realtime_file_by_iuid:
+                        if realtime_payload_cursor < len(realtime_payload_files):
+                            mapped_file = realtime_payload_files[realtime_payload_cursor]
+                            realtime_payload_cursor += 1
+                            realtime_file_by_iuid[rq_iuid] = mapped_file
+                            self._log(
+                                f"[SEND_IUID_RT_MATCH] chunk={chunk_index}/{total_chunks} kind=RQ "
+                                f"iuid={rq_iuid} file={mapped_file}"
+                            )
+                        else:
+                            self._log(
+                                f"[SEND_IUID_RT_MISS] chunk={chunk_index}/{total_chunks} kind=RQ "
+                                f"iuid={rq_iuid} reason=payload_cursor_exhausted"
+                            )
+
+                for m_ok in DCM4CHE_STORE_RSP_OK_RE.finditer(realtime_stream_buffer):
+                    rsp_ok_iuid = sanitize_uid(m_ok.group(1))
+                    if not rsp_ok_iuid or rsp_ok_iuid in realtime_seen_rsp_ok_iuids:
+                        continue
+                    realtime_seen_rsp_ok_iuids.add(rsp_ok_iuid)
+                    mapped_file = realtime_file_by_iuid.get(rsp_ok_iuid, "")
+                    if mapped_file:
+                        self._log(
+                            f"[SEND_IUID_RT_MATCH] chunk={chunk_index}/{total_chunks} kind=RSP_OK "
+                            f"iuid={rsp_ok_iuid} file={mapped_file}"
+                        )
+                        _write_realtime_iuid_row(
+                            file_path_s=mapped_file,
+                            iuid_value=rsp_ok_iuid,
+                            status_value="SENT_OK",
+                            extract_status_value="OK_FROM_STORESCU_REALTIME",
+                            detail_suffix="rsp_status=0H",
+                        )
+                    else:
+                        self._log(
+                            f"[SEND_IUID_RT_MISS] chunk={chunk_index}/{total_chunks} kind=RSP_OK "
+                            f"iuid={rsp_ok_iuid} reason=file_mapping_not_found"
+                        )
+
+                for m_err in DCM4CHE_STORE_RSP_ERR_RE.finditer(realtime_stream_buffer):
+                    rsp_err_status = (m_err.group(1) or "").strip()
+                    rsp_err_iuid = sanitize_uid(m_err.group(2))
+                    if not rsp_err_iuid or rsp_err_iuid in realtime_seen_rsp_err_iuids:
+                        continue
+                    realtime_seen_rsp_err_iuids.add(rsp_err_iuid)
+                    mapped_file = realtime_file_by_iuid.get(rsp_err_iuid, "")
+                    if mapped_file:
+                        self._log(
+                            f"[SEND_IUID_RT_MATCH] chunk={chunk_index}/{total_chunks} kind=RSP_ERR "
+                            f"iuid={rsp_err_iuid} status={rsp_err_status or 'UNKNOWN'} file={mapped_file}"
+                        )
+                        _write_realtime_iuid_row(
+                            file_path_s=mapped_file,
+                            iuid_value=rsp_err_iuid,
+                            status_value="SEND_FAIL",
+                            extract_status_value="ERR_FROM_STORESCU_REALTIME",
+                            detail_suffix=f"rsp_status={rsp_err_status or 'UNKNOWN'}",
+                        )
+                    else:
+                        self._log(
+                            f"[SEND_IUID_RT_MISS] chunk={chunk_index}/{total_chunks} kind=RSP_ERR "
+                            f"iuid={rsp_err_iuid} status={rsp_err_status or 'UNKNOWN'} reason=file_mapping_not_found"
+                        )
+
+            def _write_dcmtk_realtime_row(*, file_path_s: str, status_value: str, detail_value: str) -> None:
+                nonlocal item_cursor, sent_ok, warned, failed
+                if file_path_s in dcmtk_written_files:
+                    return
+                if file_path_s not in batch_file_set:
+                    self._log(
+                        f"[DCMTK_RT_ITEM_MISS] chunk={chunk_index}/{total_chunks} file={file_path_s} "
+                        "reason=not_in_batch"
+                    )
+                    return
+                iuid = ""
+                ts_uid = ""
+                ts_name = ""
+                extract_status = ""
+                m_err = ""
+                try:
+                    iuid, ts_uid, ts_name, m_err = self.driver.extract_metadata(self.cfg, Path(file_path_s))
+                except Exception as ex:
+                    m_err = str(ex)
+
+                if iuid:
+                    extract_status = "OK"
+                elif status_value == "SENT_OK":
+                    extract_status = "MISSING_IUID"
+                if m_err and status_value == "SENT_OK":
+                    detail_value = (detail_value + " | " + m_err).strip(" |")
+                if status_value == "SENT_UNKNOWN" and not detail_value:
+                    detail_value = "parse_status=UNKNOWN;reason=no_match_in_output"
+                if status_value == "SENT_UNKNOWN":
+                    self._log(f"[DCMTK_STATUS_DETAIL_ENRICHED] file={file_path_s} reason={detail_value}")
+
+                write_csv_row(
+                    send_results,
+                    {
+                        "run_id": run,
+                        "file_path": file_path_s,
+                        "chunk_no": chunk_index,
+                        "toolkit": self.cfg.toolkit,
+                        "ts_mode": ts_mode,
+                        "send_status": status_value,
+                        "status_detail": detail_value,
+                        "sop_instance_uid": iuid,
+                        "source_ts_uid": ts_uid,
+                        "source_ts_name": ts_name,
+                        "extract_status": extract_status,
+                        "processed_at": now_br(),
+                    },
+                    result_fields,
+                )
+
+                if status_value == "SENT_OK":
+                    sent_ok += 1
+                elif status_value in warning_statuses:
+                    warned += 1
+                    warn_type_counts[status_value] = warn_type_counts.get(status_value, 0) + 1
+                else:
+                    failed += 1
+
+                if status_value != "SENT_OK":
+                    write_telemetry_event(
+                        events,
+                        run,
+                        "SEND_FILE_ERROR",
+                        detail_value or status_value,
+                        f"chunk_no={chunk_index};file_path={file_path_s};error_type={status_value}",
+                    )
+
+                dcmtk_written_files.add(file_path_s)
+                item_cursor += 1
+                self._log(
+                    f"[DCMTK_RT_ITEM_WRITE] chunk={chunk_index}/{total_chunks} "
+                    f"status={status_value} file={file_path_s}"
+                )
+                self.progress_callback(
+                    item_cursor,
+                    total_items,
+                    attempt_chunk_no,
+                    attempt_chunks_total,
+                    chunk_index,
+                    total_chunks,
+                )
+                _write_send_checkpoint("ITEM", file_path_s)
+                self._log(
+                    f"[DCMTK_RT_CHECKPOINT] chunk={chunk_index}/{total_chunks} "
+                    f"processed_items={item_cursor}/{total_items} file={file_path_s}"
+                )
+
             with log_file.open("a", encoding="utf-8", errors="replace") as lf:
                 self.current_proc = subprocess.Popen(
                     cmd,
@@ -1582,6 +2070,28 @@ class SendWorkflow:
                     bufsize=1,
                     **hidden_process_kwargs(),
                 )
+                cancel_watcher_stop = threading.Event()
+                cancel_kill_logged = False
+
+                def _cancel_watcher() -> None:
+                    nonlocal interrupted, cancel_kill_logged
+                    while not cancel_watcher_stop.is_set():
+                        proc_ref = self.current_proc
+                        if proc_ref is None or proc_ref.poll() is not None:
+                            return
+                        if self.cancel_event.is_set():
+                            if not cancel_kill_logged:
+                                cancel_kill_logged = True
+                                self._log(
+                                    f"[SEND_CANCEL_FORCE_KILL] chunk={chunk_index}/{total_chunks} pid={proc_ref.pid}"
+                                )
+                            self._kill_current_process_tree()
+                            interrupted = True
+                            return
+                        time.sleep(0.15)
+
+                cancel_watcher_thread = threading.Thread(target=_cancel_watcher, daemon=True)
+                cancel_watcher_thread.start()
                 try:
                     assert self.current_proc.stdout is not None
                     for line in self.current_proc.stdout:
@@ -1593,14 +2103,52 @@ class SendWorkflow:
                         lines.append(clean)
                         lf.write(line)
                         lf.flush()
+                        if realtime_iuid_enabled:
+                            _process_realtime_stream_line(clean)
+                        elif dcmtk_realtime_enabled:
+                            m_file = DCMTK_SENDING_FILE_RE.search(clean)
+                            if m_file:
+                                dcmtk_current_file = m_file.group(1).strip()
+                                self._log(
+                                    f"[DCMTK_RT_PROGRESS] chunk={chunk_index}/{total_chunks} sending={dcmtk_current_file}"
+                                )
+                            m_bad = DCMTK_BAD_FILE_RE.search(clean)
+                            if m_bad:
+                                bad_file = m_bad.group(1).strip()
+                                detail = m_bad.group(2).strip()
+                                _write_dcmtk_realtime_row(
+                                    file_path_s=bad_file,
+                                    status_value="NON_DICOM",
+                                    detail_value=detail,
+                                )
+                                if dcmtk_current_file == bad_file:
+                                    dcmtk_current_file = ""
+                            m_rsp = DCMTK_STORE_RSP_RE.search(clean)
+                            if m_rsp and dcmtk_current_file:
+                                detail = m_rsp.group(1).strip()
+                                status = "SENT_OK" if "Success" in detail else "SEND_FAIL"
+                                if ("Unknown Status: 0x110" in detail) and Path(dcmtk_current_file).name.upper() == "DICOMDIR":
+                                    status = "UNSUPPORTED_DICOM_OBJECT"
+                                _write_dcmtk_realtime_row(
+                                    file_path_s=dcmtk_current_file,
+                                    status_value=status,
+                                    detail_value=detail,
+                                )
+                                dcmtk_current_file = ""
                         if show_output:
                             self._log_toolkit(clean)
                     if not interrupted:
                         self.current_proc.wait()
                         exit_code = self.current_proc.returncode if self.current_proc.returncode is not None else -1
                 finally:
+                    cancel_watcher_stop.set()
+                    cancel_watcher_thread.join(timeout=1.2)
                     self.current_proc = None
             if interrupted:
+                self._log(
+                    f"[SEND_CANCELLED_IMMEDIATE] chunk={chunk_index}/{total_chunks} "
+                    f"processed_items={item_cursor}/{total_items}"
+                )
                 break
 
             parse_exception_by_file: dict[str, list[str]] = {}
@@ -1645,23 +2193,32 @@ class SendWorkflow:
 
                 for file_path in batch_files:
                     fp = str(file_path)
+                    if fp in realtime_written_files:
+                        continue
                     item_cursor += 1
                     src_iuid = ""
                     src_ts_uid = ""
                     src_ts_name = ""
+                    uid_source = "NONE"
+                    uid_from_filename = False
                     extract_status = ""
                     meta_err = ""
                     try:
                         src_iuid, src_ts_uid, src_ts_name, meta_err = self.driver.extract_metadata(self.cfg, file_path)
                     except Exception as ex:
                         meta_err = str(ex)
-                    src_iuid = sanitize_uid(src_iuid)
-                    src_ts_uid = sanitize_uid(src_ts_uid)
-                    src_ts_name = sanitize_uid(src_ts_name)
+                    src_iuid = normalize_uid_candidate(src_iuid)
+                    src_ts_uid = normalize_uid_candidate(src_ts_uid)
+                    src_ts_name = normalize_uid_candidate(src_ts_name)
+                    if src_iuid:
+                        uid_source = "METADATA"
 
                     # Fallback: many datasets already embed SOPInstanceUID in filename.
-                    if not src_iuid:
-                        src_iuid = sanitize_uid(Path(fp).name)
+                    if not src_iuid and looks_like_dicom_payload_file(file_path):
+                        src_iuid = normalize_uid_candidate(Path(fp).name)
+                        if src_iuid:
+                            uid_source = "FILENAME_FALLBACK"
+                            uid_from_filename = True
                     inferred_iuid = inferred_iuid_by_file.get(fp, "")
                     if (
                         inferred_iuid
@@ -1677,12 +2234,14 @@ class SendWorkflow:
                             src_iuid_prev = ""
                             src_iuid = inferred_iuid
                         uid_was_inferred = True
+                        uid_source = "RQ_ORDER"
                     else:
                         src_iuid_prev = ""
                         uid_was_inferred = False
 
                     detail = (
-                        f"dcm4che parse: rq_iuids={len(rq_iuid_set)};ok_iuids={len(ok_iuids)};"
+                        f"dcm4che parse: iuid_mode={dcm4che_iuid_update_mode};"
+                        f"rq_iuids={len(rq_iuid_set)};ok_iuids={len(ok_iuids)};"
                         f"err_iuids={len(err_iuids)};exit_code={exit_code}"
                     )
                     if meta_err:
@@ -1711,6 +2270,15 @@ class SendWorkflow:
                     else:
                         status = "SENT_UNKNOWN"
                         extract_status = "NO_MATCH"
+                        detail += f";uid_source={uid_source}"
+                        if src_iuid and src_iuid not in ok_iuid_set and src_iuid not in err_iuid_set and src_iuid not in rq_iuid_set:
+                            src_iuid = ""
+                            detail += ";uid_persisted=NO"
+                            extract_status = "NO_MATCH_UID_UNCONFIRMED"
+                        elif src_iuid:
+                            detail += ";uid_persisted=YES"
+                        if uid_from_filename and not src_iuid:
+                            detail += ";uid_filename_fallback_rejected=YES"
 
                     if status == "SENT_OK":
                         sent_ok += 1
@@ -1739,6 +2307,11 @@ class SendWorkflow:
                         result_fields,
                     )
                     if status != "SENT_OK":
+                        if status == "SENT_UNKNOWN":
+                            self._log(
+                                f"[SEND_UID_SOURCE] file={fp} source={uid_source} "
+                                f"persisted={'YES' if src_iuid else 'NO'} extract_status={extract_status}"
+                            )
                         write_telemetry_event(
                             events,
                             run,
@@ -1774,10 +2347,20 @@ class SendWorkflow:
                             parse_notes[0],
                             f"chunk_no={chunk_index};file_path={fp};errors={len(parse_notes)}",
                         )
-                    self.progress_callback(item_cursor, total_items, chunk_index, total_chunks)
+                    self.progress_callback(
+                        item_cursor,
+                        total_items,
+                        attempt_chunk_no,
+                        attempt_chunks_total,
+                        chunk_index,
+                        total_chunks,
+                    )
+                    _write_send_checkpoint("ITEM", fp)
             else:
                 for file_path in batch_files:
                     fp = str(file_path)
+                    if fp in dcmtk_written_files:
+                        continue
                     item_cursor += 1
                     base = parsed.get(fp, {"send_status": "SENT_UNKNOWN", "status_detail": ""})
                     status = base.get("send_status", "SENT_UNKNOWN")
@@ -1797,10 +2380,14 @@ class SendWorkflow:
                         extract_status = "MISSING_IUID"
                     if m_err and status == "SENT_OK":
                         detail = (detail + " | " + m_err).strip(" |")
+                    if status == "SENT_UNKNOWN" and not detail:
+                        detail = "parse_status=UNKNOWN;reason=no_match_in_output"
+                    if status == "SENT_UNKNOWN" and detail:
+                        self._log(f"[DCMTK_STATUS_DETAIL_ENRICHED] file={fp} reason={detail}")
 
                     if status == "SENT_OK":
                         sent_ok += 1
-                    elif status in ["NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"]:
+                    elif status in warning_statuses:
                         warned += 1
                         warn_type_counts[status] = warn_type_counts.get(status, 0) + 1
                     else:
@@ -1842,16 +2429,17 @@ class SendWorkflow:
                             parse_notes[0],
                             f"chunk_no={chunk_index};file_path={fp};errors={len(parse_notes)}",
                         )
-                    self.progress_callback(item_cursor, total_items, chunk_index, total_chunks)
+                    self.progress_callback(
+                        item_cursor,
+                        total_items,
+                        attempt_chunk_no,
+                        attempt_chunks_total,
+                        chunk_index,
+                        total_chunks,
+                    )
+                    _write_send_checkpoint("ITEM", fp)
             unit_cursor += len(batch_inputs)
-            checkpoint.write_text(
-                json.dumps(
-                    {"run_id": run, "done_units": unit_cursor, "done_files": item_cursor, "updated_at": now_br()},
-                    ensure_ascii=True,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            _write_send_checkpoint("CHUNK_SYNC")
             write_telemetry_event(
                 events,
                 run,
@@ -1869,7 +2457,34 @@ class SendWorkflow:
                 f"exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'TOOLKIT_DEFAULT'}"
             )
 
-        final_status = "INTERRUPTED" if interrupted else ("PASS" if failed == 0 and warned == 0 else ("PASS_WITH_WARNINGS" if failed == 0 else "FAIL"))
+        aggregated_sent_ok = sent_ok
+        aggregated_warn = warned
+        aggregated_fail = failed
+        aggregated_items_processed = item_cursor
+        try:
+            latest_by_file: dict[str, dict] = {}
+            for row in read_csv_rows(send_results):
+                fp = str(row.get("file_path", "")).strip()
+                if fp in selected_file_set:
+                    latest_by_file[fp] = row
+            aggregated_items_processed = len(latest_by_file)
+            aggregated_sent_ok = 0
+            aggregated_warn = 0
+            aggregated_fail = 0
+            for fp, row in latest_by_file.items():
+                status_v = str(row.get("send_status", "SENT_UNKNOWN")).strip() or "SENT_UNKNOWN"
+                if status_v == "SENT_OK":
+                    aggregated_sent_ok += 1
+                elif status_v in warning_statuses:
+                    aggregated_warn += 1
+                else:
+                    aggregated_fail += 1
+        except Exception:
+            pass
+
+        final_status = "INTERRUPTED" if interrupted else (
+            "PASS" if aggregated_fail == 0 and aggregated_warn == 0 else ("PASS_WITH_WARNINGS" if aggregated_fail == 0 else "FAIL")
+        )
         send_duration_sec = round(max(time.monotonic() - send_start_ts, 0.0), 3)
         write_csv_row(
             send_summary,
@@ -1878,10 +2493,10 @@ class SendWorkflow:
                 "toolkit": self.cfg.toolkit,
                 "ts_mode_effective": ts_mode,
                 "total_items": total_items,
-                "items_processed": item_cursor,
-                "sent_ok": sent_ok,
-                "warnings": warned,
-                "failed": failed,
+                "items_processed": aggregated_items_processed,
+                "sent_ok": aggregated_sent_ok,
+                "warnings": aggregated_warn,
+                "failed": aggregated_fail,
                 "status": final_status,
                 "send_duration_sec": send_duration_sec,
                 "finished_at": now_br(),
@@ -1900,10 +2515,10 @@ class SendWorkflow:
             f"duration={format_duration_sec(send_duration_sec)}"
         )
         self._log(
-            f"[SEND_RESULT] ok={sent_ok} warn={warned} fail={failed} status={final_status} "
+            f"[SEND_RESULT] ok={aggregated_sent_ok} warn={aggregated_warn} fail={aggregated_fail} status={final_status} "
             f"duration={format_duration_sec(send_duration_sec)}"
         )
-        if warned > 0:
+        if aggregated_warn > 0:
             self._log(
                 "[SEND_WARN_SUMMARY] "
                 f"sent_unknown={warn_type_counts.get('SENT_UNKNOWN', 0)} "
@@ -2440,6 +3055,9 @@ class ConfigDialog(tk.Toplevel):
         self.var_collect_size = tk.BooleanVar(value=bool(config.collect_size_bytes))
         self.var_ts = tk.StringVar(value=config.ts_mode)
         self.var_dcm4che_send_mode = tk.StringVar(value=normalize_dcm4che_send_mode(config.dcm4che_send_mode))
+        self.var_dcm4che_iuid_update_mode = tk.StringVar(
+            value=normalize_dcm4che_iuid_update_mode(config.dcm4che_iuid_update_mode)
+        )
 
         frm = ttk.Frame(self, padding=12)
         frm.grid(sticky="nsew")
@@ -2465,9 +3083,19 @@ class ConfigDialog(tk.Toplevel):
         self.cmb_dcm4che_mode.grid(row=7, column=1, sticky="we", pady=3)
         if isinstance(self.cmb_dcm4che_mode, ttk.Combobox):
             self.cmb_dcm4che_mode.bind("<<ComboboxSelected>>", lambda _e: self._toggle_extension_controls())
+        self.lbl_dcm4che_iuid_mode = ttk.Label(frm, text="Atualizacao de IUID (dcm4che)")
+        self.lbl_dcm4che_iuid_mode.grid(row=8, column=0, sticky="w", pady=3)
+        self.cmb_dcm4che_iuid_mode = ttk.Combobox(
+            frm,
+            textvariable=self.var_dcm4che_iuid_update_mode,
+            values=["REALTIME", "CHUNK_END"],
+            width=56,
+            state="readonly",
+        )
+        self.cmb_dcm4che_iuid_mode.grid(row=8, column=1, sticky="we", pady=3)
 
         self.filter_frame = ttk.LabelFrame(frm, text="Filtro de arquivos para analise", padding=8)
-        self.filter_frame.grid(row=8, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.filter_frame.grid(row=9, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.filter_frame.columnconfigure(1, weight=1)
         self.chk_include_all = ttk.Checkbutton(
             self.filter_frame,
@@ -2491,12 +3119,12 @@ class ConfigDialog(tk.Toplevel):
             frm,
             text="Calcular size_bytes na analise (mais lento)",
             variable=self.var_collect_size,
-        ).grid(row=9, column=0, columnspan=2, sticky="w")
-        self._row_entry(frm, 10, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
+        ).grid(row=10, column=0, columnspan=2, sticky="w")
+        self._row_entry(frm, 11, "TS mode", self.var_ts, combo_values=["AUTO", "JPEG_LS_LOSSLESS", "UNCOMPRESSED_STANDARD"])
         self._toggle_dcm4che_controls()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=11, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btns.grid(row=12, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btns, text="Testar Echo", command=self._test_echo).pack(side="left", padx=4)
         ttk.Button(btns, text="Salvar", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Fechar", command=self.destroy).pack(side="left", padx=4)
@@ -2541,9 +3169,13 @@ class ConfigDialog(tk.Toplevel):
         if is_dcm4che:
             self.lbl_dcm4che_mode.grid()
             self.cmb_dcm4che_mode.grid()
+            self.lbl_dcm4che_iuid_mode.grid()
+            self.cmb_dcm4che_iuid_mode.grid()
         else:
             self.lbl_dcm4che_mode.grid_remove()
             self.cmb_dcm4che_mode.grid_remove()
+            self.lbl_dcm4che_iuid_mode.grid_remove()
+            self.cmb_dcm4che_iuid_mode.grid_remove()
         self._toggle_extension_controls()
 
     def _build_config(self) -> AppConfig:
@@ -2561,6 +3193,7 @@ class ConfigDialog(tk.Toplevel):
             collect_size_bytes=bool(self.var_collect_size.get()),
             ts_mode=self.var_ts.get().strip(),
             dcm4che_send_mode=normalize_dcm4che_send_mode(self.var_dcm4che_send_mode.get().strip()),
+            dcm4che_iuid_update_mode=normalize_dcm4che_iuid_update_mode(self.var_dcm4che_iuid_update_mode.get().strip()),
         )
 
     def _test_echo(self):
@@ -2599,15 +3232,23 @@ class App(tk.Tk):
         self.cancel_event = threading.Event()
 
         self.progress_items_var = tk.StringVar(value="enviando item 0 de 0")
-        self.progress_chunks_var = tk.StringVar(value="batch chunk 0 de 0")
+        self.progress_chunks_var = tk.StringVar(value="batch chunk 0 de 0 | retomada #0")
         self.analysis_progress_var = tk.StringVar(value="progresso analise: aguardando")
         self.log_filter_options = ["Todos", "Sistema", "Warnings + Erros"]
         self.var_log_filter_an = tk.StringVar(value="Todos")
         self.var_log_filter_send = tk.StringVar(value="Todos")
         self.var_log_filter_val = tk.StringVar(value="Todos")
         self._max_log_buffer_lines = 6000
+        self._log_refresh_batch_size = 300
+        self._log_filter_debounce_ms = 180
         self._log_buffers: dict[str, list[tuple[str, str, str]]] = {"an": [], "send": [], "val": []}
+        self._log_buffer_versions: dict[str, int] = {"an": 0, "send": 0, "val": 0}
         self._log_widgets: dict[str, tk.Text] = {}
+        self._log_refresh_tokens: dict[str, int] = {"an": 0, "send": 0, "val": 0}
+        self._log_refresh_after_ids: dict[str, str | None] = {"an": None, "send": None, "val": None}
+        self._log_render_after_ids: dict[str, str | None] = {"an": None, "send": None, "val": None}
+        self._log_render_state: dict[str, dict] = {}
+        self._log_filter_cache: dict[tuple, list[tuple[str, str, str]]] = {}
         self.activity_status_an = tk.StringVar(value="ocioso")
         self.activity_status_send = tk.StringVar(value="ocioso")
         self.activity_status_val = tk.StringVar(value="ocioso")
@@ -2641,6 +3282,7 @@ class App(tk.Tk):
         # Keep runs local to the app by default; this setting is no longer exposed in UI.
         cfg.runs_base_dir = ""
         cfg.dcm4che_send_mode = normalize_dcm4che_send_mode(cfg.dcm4che_send_mode)
+        cfg.dcm4che_iuid_update_mode = normalize_dcm4che_iuid_update_mode(cfg.dcm4che_iuid_update_mode)
         apply_internal_toolkit_paths(cfg, self.base_dir)
         return cfg
 
@@ -2662,7 +3304,8 @@ class App(tk.Tk):
             f"batch={cfg.batch_size_default} restrict_extensions={'ON' if cfg.restrict_extensions else 'OFF'} "
             f"include_no_extension={'ON' if cfg.include_no_extension else 'OFF'} "
             f"collect_size_bytes={'ON' if cfg.collect_size_bytes else 'OFF'} "
-            f"dcm4che_send_mode={cfg.dcm4che_send_mode}"
+            f"dcm4che_send_mode={cfg.dcm4che_send_mode} "
+            f"dcm4che_iuid_update_mode={cfg.dcm4che_iuid_update_mode}"
         )
         self._log_an("Configuracoes atualizadas.")
         if mode_changed:
@@ -2689,16 +3332,16 @@ class App(tk.Tk):
         menu.add_command(label="Sobre", command=self._show_about)
 
     def _build_ui(self):
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
-        self.tab_an = ttk.Frame(nb)
-        self.tab_send = ttk.Frame(nb)
-        self.tab_val = ttk.Frame(nb)
-        self.tab_runs = ttk.Frame(nb)
-        nb.add(self.tab_an, text="Analise")
-        nb.add(self.tab_send, text="Send")
-        nb.add(self.tab_val, text="Validacao")
-        nb.add(self.tab_runs, text="Runs")
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True)
+        self.tab_an = ttk.Frame(self.nb)
+        self.tab_send = ttk.Frame(self.nb)
+        self.tab_val = ttk.Frame(self.nb)
+        self.tab_runs = ttk.Frame(self.nb)
+        self.nb.add(self.tab_an, text="Analise")
+        self.nb.add(self.tab_send, text="Send")
+        self.nb.add(self.tab_val, text="Validacao")
+        self.nb.add(self.tab_runs, text="Runs")
         self._build_analyze_tab()
         self._build_send_tab()
         self._build_validation_tab()
@@ -2755,7 +3398,7 @@ class App(tk.Tk):
             state="readonly",
         )
         cmb_filter_an.pack(side="left", padx=(8, 0))
-        cmb_filter_an.bind("<<ComboboxSelected>>", lambda _e: self._refresh_log_view("an"))
+        cmb_filter_an.bind("<<ComboboxSelected>>", lambda _e: self._on_log_filter_changed("an"))
 
         log_frame = ttk.Frame(self.tab_an, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
@@ -2778,20 +3421,21 @@ class App(tk.Tk):
         self.cmb_send_runs.grid(row=0, column=1, sticky="w", padx=6)
         self.cmb_send_runs.bind("<<ComboboxSelected>>", lambda _e: self._on_send_run_selected())
         ttk.Button(top, text="Atualizar", command=self._refresh_run_list).grid(row=0, column=2, padx=4)
+        ttk.Button(top, text="Novo run", command=self._new_run_from_send).grid(row=0, column=3, padx=4)
         ttk.Checkbutton(
             top,
             text="Exibir mensagens internas do sistema",
             variable=self.var_show_send_internal,
-            command=lambda: self._refresh_log_view("send"),
+            command=lambda: self._on_log_filter_changed("send"),
         ).grid(row=1, column=1, sticky="w", padx=6)
         ttk.Checkbutton(
             top,
             text="Exibir output bruto da toolkit (tempo real)",
             variable=self.var_show_output,
-            command=lambda: self._refresh_log_view("send"),
+            command=lambda: self._on_log_filter_changed("send"),
         ).grid(row=2, column=1, sticky="w", padx=6)
         btns = ttk.Frame(top)
-        btns.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        btns.grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
         ttk.Button(btns, text="Iniciar Send", command=self._start_send).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancelar", command=self._cancel_current_job).pack(side="left", padx=4)
 
@@ -2829,7 +3473,7 @@ class App(tk.Tk):
             state="readonly",
         )
         cmb_filter_send.pack(side="left", padx=(8, 0))
-        cmb_filter_send.bind("<<ComboboxSelected>>", lambda _e: self._refresh_log_view("send"))
+        cmb_filter_send.bind("<<ComboboxSelected>>", lambda _e: self._on_log_filter_changed("send"))
 
         log_frame = ttk.Frame(self.tab_send, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
@@ -2884,7 +3528,7 @@ class App(tk.Tk):
             state="readonly",
         )
         cmb_filter_val.pack(side="left", padx=(8, 0))
-        cmb_filter_val.bind("<<ComboboxSelected>>", lambda _e: self._refresh_log_view("val"))
+        cmb_filter_val.bind("<<ComboboxSelected>>", lambda _e: self._on_log_filter_changed("val"))
         log_frame = ttk.Frame(self.tab_val, padding=(10, 0, 10, 10))
         log_frame.pack(fill="both", expand=True)
         self.txt_val = tk.Text(log_frame, wrap="none")
@@ -3165,13 +3809,32 @@ class App(tk.Tk):
         self.cancel_event.clear()
         self._log_send("Iniciando envio...")
         self.progress_items_var.set("enviando item 0 de 0")
-        self.progress_chunks_var.set("batch chunk 0 de 0")
+        self.progress_chunks_var.set("batch chunk 0 de 0 | retomada #0")
         show_output = bool(self.var_show_output.get())
         self._set_activity_context("Send")
         self._set_activity_running(True)
 
-        def progress(items_done, items_total, chunk_no, chunk_total):
-            self.queue.put(("send_progress", (items_done, items_total, chunk_no, chunk_total)))
+        def progress(
+            items_done,
+            items_total,
+            attempt_chunk_no,
+            attempt_chunk_total,
+            tech_chunk_no,
+            tech_chunk_total,
+        ):
+            self.queue.put(
+                (
+                    "send_progress",
+                    (
+                        items_done,
+                        items_total,
+                        attempt_chunk_no,
+                        attempt_chunk_total,
+                        tech_chunk_no,
+                        tech_chunk_total,
+                    ),
+                )
+            )
 
         def task():
             try:
@@ -3189,6 +3852,21 @@ class App(tk.Tk):
 
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
+
+    def _new_run_from_send(self):
+        if self._worker_busy():
+            messagebox.showwarning("Em execucao", "Ha um processo em execucao. Aguarde ou cancele antes de iniciar novo run.")
+            return
+        self.var_send_run.set("")
+        self.var_run_id.set("")
+        self._batch_size_max_cmd_limit = None
+        self._batch_size_max_cmd_source = ""
+        self._log_send("[RUN_NEW] Novo run solicitado na aba Send; selecao atual de run foi limpa.")
+        self._log_an("[RUN_NEW] Pronto para nova analise. Informe pasta e execute 'Analisar Pasta'.")
+        try:
+            self.nb.select(self.tab_an)
+        except Exception:
+            pass
 
     def _start_validation(self):
         if self._worker_busy():
@@ -3245,7 +3923,7 @@ class App(tk.Tk):
             return
         self.cancel_event.set()
         self._log_an("Cancelamento solicitado...")
-        self._log_send("Cancelamento solicitado...")
+        self._log_send("[SEND_CANCEL_REQUEST] Cancelamento solicitado...")
         self._log_val("Cancelamento solicitado...")
 
     def _setup_log_tags(self, widget: tk.Text) -> None:
@@ -3311,13 +3989,20 @@ class App(tk.Tk):
             return self.var_log_filter_val.get().strip() or "Todos"
         return "Todos"
 
-    def _line_matches_filter(self, panel: str, tag: str, source: str) -> bool:
+    def _line_matches_filter_values(
+        self,
+        panel: str,
+        tag: str,
+        source: str,
+        mode: str,
+        show_send_internal: bool,
+        show_send_toolkit: bool,
+    ) -> bool:
         if panel == "send":
-            if source == "internal" and not bool(self.var_show_send_internal.get()):
+            if source == "internal" and not show_send_internal:
                 return False
-            if source == "toolkit" and not bool(self.var_show_output.get()):
+            if source == "toolkit" and not show_send_toolkit:
                 return False
-        mode = self._log_filter_mode(panel)
         if mode == "Todos":
             return True
         if mode == "Sistema":
@@ -3326,32 +4011,229 @@ class App(tk.Tk):
             return tag in ["log_warn", "log_error"]
         return True
 
-    def _append_widget_line(self, widget: tk.Text, text: str, tag: str) -> None:
+    def _line_matches_filter(self, panel: str, tag: str, source: str) -> bool:
+        return self._line_matches_filter_values(
+            panel,
+            tag,
+            source,
+            self._log_filter_mode(panel),
+            bool(self.var_show_send_internal.get()),
+            bool(self.var_show_output.get()),
+        )
+
+    def _append_widget_line(
+        self,
+        widget: tk.Text,
+        text: str,
+        tag: str,
+        *,
+        enforce_limit: bool = True,
+        auto_scroll: bool = True,
+    ) -> None:
         if tag:
             widget.insert("end", text + "\n", tag)
         else:
             widget.insert("end", text + "\n")
+        if enforce_limit:
+            line_count = int(widget.index("end-1c").split(".")[0])
+            if line_count > self._max_log_buffer_lines:
+                excess = line_count - self._max_log_buffer_lines
+                widget.delete("1.0", f"{excess + 1}.0")
+        if auto_scroll:
+            widget.see("end")
+
+    def _build_log_view_cache_key(self, panel: str, mode: str, show_send_internal: bool, show_send_toolkit: bool) -> tuple:
+        return (
+            panel,
+            mode,
+            show_send_internal if panel == "send" else True,
+            show_send_toolkit if panel == "send" else True,
+            self._log_buffer_versions.get(panel, 0),
+        )
+
+    def _emit_log_refresh_marker(self, panel: str, message: str) -> None:
+        print(message)
+
+    def _on_log_filter_changed(self, panel: str) -> None:
+        mode = self._log_filter_mode(panel)
+        self._emit_log_refresh_marker(panel, f"[LOG_FILTER_CHANGE] panel={panel} mode={mode}")
+        self._schedule_log_refresh(panel, debounce_ms=self._log_filter_debounce_ms)
+
+    def _schedule_log_refresh(self, panel: str, debounce_ms: int) -> None:
+        prev_after = self._log_refresh_after_ids.get(panel)
+        if prev_after:
+            try:
+                self.after_cancel(prev_after)
+            except Exception:
+                pass
+        self._log_refresh_after_ids[panel] = self.after(
+            max(debounce_ms, 0),
+            lambda: self._start_log_refresh(panel),
+        )
+
+    def _start_log_refresh(self, panel: str) -> None:
+        widget = self._log_widgets.get(panel)
+        if widget is None:
+            return
+        self._log_refresh_after_ids[panel] = None
+        token = self._log_refresh_tokens.get(panel, 0) + 1
+        self._log_refresh_tokens[panel] = token
+        mode = self._log_filter_mode(panel)
+        show_send_internal = bool(self.var_show_send_internal.get())
+        show_send_toolkit = bool(self.var_show_output.get())
+        cache_key = self._build_log_view_cache_key(panel, mode, show_send_internal, show_send_toolkit)
+        cached = self._log_filter_cache.get(cache_key)
+        if cached is not None:
+            self._emit_log_refresh_marker(
+                panel,
+                f"[LOG_REFRESH_START] panel={panel} token={token} mode={mode} "
+                f"buffer={len(self._log_buffers.get(panel, []))} source=CACHE",
+            )
+            self._begin_log_refresh_render(panel, token, list(cached), build_duration_ms=0, source="CACHE")
+            return
+
+        snapshot = list(self._log_buffers.get(panel, []))
+        self._emit_log_refresh_marker(
+            panel,
+            f"[LOG_REFRESH_START] panel={panel} token={token} mode={mode} "
+            f"buffer={len(snapshot)} source=WORKER",
+        )
+
+        worker = threading.Thread(
+            target=self._compute_log_refresh_snapshot,
+            args=(panel, token, snapshot, mode, show_send_internal, show_send_toolkit, cache_key),
+            daemon=True,
+        )
+        worker.start()
+
+    def _compute_log_refresh_snapshot(
+        self,
+        panel: str,
+        token: int,
+        snapshot: list[tuple[str, str, str]],
+        mode: str,
+        show_send_internal: bool,
+        show_send_toolkit: bool,
+        cache_key: tuple,
+    ) -> None:
+        start = time.monotonic()
+        filtered: list[tuple[str, str, str]] = []
+        for text, tag, source in snapshot:
+            if self._line_matches_filter_values(panel, tag, source, mode, show_send_internal, show_send_toolkit):
+                filtered.append((text, tag, source))
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        self.queue.put(
+            (
+                "log_refresh_ready",
+                {
+                    "panel": panel,
+                    "token": token,
+                    "lines": filtered,
+                    "cache_key": cache_key,
+                    "build_duration_ms": elapsed_ms,
+                },
+            )
+        )
+
+    def _begin_log_refresh_render(
+        self,
+        panel: str,
+        token: int,
+        filtered_lines: list[tuple[str, str, str]],
+        *,
+        build_duration_ms: int,
+        source: str,
+    ) -> None:
+        widget = self._log_widgets.get(panel)
+        if widget is None:
+            return
+        prev_render = self._log_render_after_ids.get(panel)
+        if prev_render:
+            try:
+                self.after_cancel(prev_render)
+            except Exception:
+                pass
+            self._log_render_after_ids[panel] = None
+        self._log_render_state[panel] = {
+            "token": token,
+            "lines": filtered_lines,
+            "index": 0,
+            "inserted": 0,
+            "started_at": time.monotonic(),
+            "build_duration_ms": build_duration_ms,
+            "source": source,
+        }
+        widget.delete("1.0", "end")
+        self._log_render_after_ids[panel] = self.after(0, lambda: self._render_log_refresh_batch(panel))
+
+    def _render_log_refresh_batch(self, panel: str) -> None:
+        state = self._log_render_state.get(panel)
+        widget = self._log_widgets.get(panel)
+        if not state or widget is None:
+            return
+        token = state.get("token", 0)
+        if token != self._log_refresh_tokens.get(panel, 0):
+            self._emit_log_refresh_marker(
+                panel,
+                f"[LOG_REFRESH_CANCELLED] panel={panel} stale_token={token}",
+            )
+            self._log_render_state.pop(panel, None)
+            self._log_render_after_ids[panel] = None
+            return
+
+        lines = state.get("lines", [])
+        idx = int(state.get("index", 0))
+        next_idx = min(idx + self._log_refresh_batch_size, len(lines))
+        batch = lines[idx:next_idx]
+        for text, tag, _source in batch:
+            self._append_widget_line(widget, text, tag, enforce_limit=False, auto_scroll=False)
+        state["index"] = next_idx
+        state["inserted"] = int(state.get("inserted", 0)) + len(batch)
+
+        if next_idx < len(lines):
+            remaining = len(lines) - next_idx
+            self._emit_log_refresh_marker(
+                panel,
+                f"[LOG_REFRESH_BATCH] panel={panel} token={token} inserted={state.get('inserted', 0)} "
+                f"remaining={remaining}",
+            )
+            self._log_render_after_ids[panel] = self.after(1, lambda: self._render_log_refresh_batch(panel))
+            return
+
+        # finalize view housekeeping once per refresh
         line_count = int(widget.index("end-1c").split(".")[0])
         if line_count > self._max_log_buffer_lines:
             excess = line_count - self._max_log_buffer_lines
             widget.delete("1.0", f"{excess + 1}.0")
         widget.see("end")
+        elapsed_ms = int((time.monotonic() - float(state.get("started_at", time.monotonic()))) * 1000)
+        self._emit_log_refresh_marker(
+            panel,
+            f"[LOG_REFRESH_END] panel={panel} token={token} inserted={state.get('inserted', 0)} "
+            f"build_ms={state.get('build_duration_ms', 0)} render_ms={elapsed_ms} source={state.get('source', 'UNK')}",
+        )
+        self._log_render_state.pop(panel, None)
+        self._log_render_after_ids[panel] = None
 
     def _refresh_log_view(self, panel: str) -> None:
-        widget = self._log_widgets.get(panel)
-        if widget is None:
-            return
-        widget.delete("1.0", "end")
-        for text, tag, source in self._log_buffers.get(panel, []):
-            if self._line_matches_filter(panel, tag, source):
-                self._append_widget_line(widget, text, tag)
+        self._schedule_log_refresh(panel, debounce_ms=0)
 
     def _append_log_line(self, panel: str, text: str, source: str = "internal") -> None:
         tag = self._classify_log_tag(text)
         buf = self._log_buffers.setdefault(panel, [])
         buf.append((text, tag, source))
         if len(buf) > self._max_log_buffer_lines:
-            del buf[: len(buf) - self._max_log_buffer_lines]
+            removed = len(buf) - self._max_log_buffer_lines
+            del buf[:removed]
+            print(f"[LOG_BUFFER_TRIM] panel={panel} removed={removed} max={self._max_log_buffer_lines}")
+        self._log_buffer_versions[panel] = self._log_buffer_versions.get(panel, 0) + 1
+        if len(self._log_filter_cache) > 32:
+            latest_versions = self._log_buffer_versions.copy()
+            self._log_filter_cache = {
+                key: val
+                for key, val in self._log_filter_cache.items()
+                if latest_versions.get(key[0], -1) == key[4]
+            }
         if not self._line_matches_filter(panel, tag, source):
             return
         widget = self._log_widgets.get(panel)
@@ -3392,6 +4274,25 @@ class App(tk.Tk):
                     self._log_send(payload, source="toolkit")
                 elif event == "val_log":
                     self._log_val(payload)
+                elif event == "log_refresh_ready":
+                    panel = payload.get("panel", "")
+                    token = int(payload.get("token", 0))
+                    if token != self._log_refresh_tokens.get(panel, 0):
+                        self._emit_log_refresh_marker(
+                            panel,
+                            f"[LOG_REFRESH_CANCELLED] panel={panel} stale_token={token} reason=worker_result",
+                        )
+                        continue
+                    cache_key = payload.get("cache_key")
+                    if isinstance(cache_key, tuple):
+                        self._log_filter_cache[cache_key] = list(payload.get("lines", []))
+                    self._begin_log_refresh_render(
+                        panel,
+                        token,
+                        list(payload.get("lines", [])),
+                        build_duration_ms=int(payload.get("build_duration_ms", 0)),
+                        source="WORKER",
+                    )
                 elif event == "an_done":
                     an_duration = payload.get("analysis_duration_sec")
                     if an_duration is not None:
@@ -3421,9 +4322,9 @@ class App(tk.Tk):
                         f"- duracao analise: {format_duration_sec(float(payload.get('analysis_duration_sec') or 0))}"
                     )
                 elif event == "send_progress":
-                    done, total, cno, ctot = payload
+                    done, total, cno, ctot, tech_no, _tech_total = payload
                     self.progress_items_var.set(f"enviando item {done} de {total}")
-                    self.progress_chunks_var.set(f"batch chunk {cno} de {ctot}")
+                    self.progress_chunks_var.set(f"batch chunk {cno} de {ctot} | retomada #{tech_no}")
                 elif event == "send_done":
                     status = payload.get("status")
                     send_duration = payload.get("send_duration_sec")
