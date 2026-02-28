@@ -91,15 +91,60 @@ foreach ($f in $zips) {
     }
 }
 
+function Select-ZipForTagInteractive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Tag,
+        [Parameter(Mandatory = $true)]
+        [object[]]$Files
+    )
+
+    $sorted = $Files | Sort-Object LastWriteTime -Descending
+    if ($sorted.Count -le 1) {
+        return $sorted[0]
+    }
+
+    Write-Host "[WARN] Foram encontrados $($sorted.Count) zips para a tag $Tag."
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        $item = $sorted[$i]
+        $n = $i + 1
+        Write-Host ("  [{0}] {1} | {2} | {3}" -f $n, $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $item.Name, $item.FullName)
+    }
+
+    $latest = $sorted[0]
+    $answer = Read-Host "[PERGUNTA] Enviar o mais recente? [S/n]"
+    if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(s|sim|y|yes)$') {
+        return $latest
+    }
+
+    while ($true) {
+        $pick = Read-Host "[PERGUNTA] Digite o numero do zip para enviar, ou P para pular esta tag"
+        if ($pick -match '^(p|skip|n|nao)$') {
+            return $null
+        }
+        if ($pick -match '^\d+$') {
+            $idx = [int]$pick
+            if ($idx -ge 1 -and $idx -le $sorted.Count) {
+                return $sorted[$idx - 1]
+            }
+        }
+        Write-Host "[WARN] Opcao invalida. Tente novamente."
+    }
+}
+
 foreach ($tag in $Tags) {
     $tag = $tag.Trim()
     if (-not $byVersion[$tag]) {
         Write-Host "[SKIP] Nenhum zip para tag $tag em $DistRoot"
         continue
     }
-    $latest = $byVersion[$tag] | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    $path = $latest.FullName
-    $fileName = $latest.Name
+    $selectedZip = Select-ZipForTagInteractive -Tag $tag -Files $byVersion[$tag]
+    if (-not $selectedZip) {
+        Write-Host "[SKIP] Upload cancelado para tag $tag."
+        continue
+    }
+    $path = $selectedZip.FullName
+    $fileName = $selectedZip.Name
 
     Write-Host "[INFO] Anexando a $tag : $path"
 
