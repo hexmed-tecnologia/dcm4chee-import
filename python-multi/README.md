@@ -79,10 +79,10 @@ Exemplos práticos de leitura:
 - Início e fim da análise: `ANALYSIS_END`, `ANALYSIS_CANCELLED`
 - Envio:
   - `RUN_SEND_START`, `CHUNK_START`, `CHUNK_END`, `RUN_SEND_END`
-  - `RUN_SEND_MODE`, `CHUNK_CMD_META`, `CHUNK_SPLIT_PLAN`, `CHUNK_CMD_OVER_LIMIT`, `CHUNK_JAVA_ARGFILE`
+  - `RUN_SEND_MODE`, `RUN_SEND_JAVA_HEALTHCHECK`, `RUN_SEND_RESUME`, `CHUNK_CMD_META`, `CHUNK_JAVA_ARGFILE`, `SEND_IUID_REALTIME`
   - Falha por item: `SEND_FILE_ERROR` (use `ref` para localizar `file_path` e `error_type`)
   - Erros de parsing/scan no storescu: `SEND_PARSE_EXCEPTION`
-  - Marcadores de diagnostico no log: `[SEND_START]`, `[SEND_EXEC_MODE]`, `[CHUNK_START]`, `[CHUNK_CMD]`, `[CHUNK_SPLIT]`, `[CMDLEN_GUARD_WARN]`, `[CHUNK_END]`, `[SEND_END]`, `[SEND_PARSE_MISMATCH]`, `[RUN_ID_GUARD]`, `[BATCH_AUTO_MAX]`, `[BATCH_LIMIT_GUARD]`
+  - Marcadores de diagnostico no log: `[SEND_START]`, `[SEND_EXEC_MODE]`, `[JAVA_HEALTHCHECK]`, `[CHUNK_START]`, `[CHUNK_CMD]`, `[SEND_CHECKPOINT_ITEM]`, `[SEND_CANCEL_REQUEST]`, `[SEND_CANCEL_FORCE_KILL]`, `[SEND_CANCELLED_IMMEDIATE]`, `[SEND_IUID_REALTIME]`, `[SEND_IUID_RT_MATCH]`, `[SEND_IUID_RT_MISS]`, `[DCMTK_RT_PROGRESS]`, `[DCMTK_RT_ITEM_WRITE]`, `[DCMTK_RT_CHECKPOINT]`, `[CHUNK_END]`, `[SEND_END]`, `[SEND_PARSE_MISMATCH]`, `[SEND_UID_SOURCE]`, `[DCMTK_STATUS_DETAIL_ENRICHED]`, `[RUN_ID_GUARD]`, `[BATCH_AUTO_MAX]`, `[BATCH_LIMIT_GUARD]`, `[LOG_FILTER_CHANGE]`, `[LOG_REFRESH_START]`, `[LOG_REFRESH_BATCH]`, `[LOG_REFRESH_CANCELLED]`, `[LOG_REFRESH_END]`, `[LOG_BUFFER_TRIM]`
 - Consistência/validação: `CONSISTENCY_FILLED`, `CONSISTENCY_MISSING`
 - Execução sem trabalho novo: `RUN_SEND_SKIP_ALREADY_COMPLETED`
 
@@ -125,16 +125,24 @@ No menu `Configuracao -> Configuracoes`:
 - PACS DICOM host (C-STORE) e PACS DICOM port (C-STORE)
 - Host REST para validacao
 - Tamanho de batch
-  - para `dcm4che` no Windows, o envio prefere `JAVA_DIRECT` com `@argfile` (evita limitacao do `cmd`)
+  - para `dcm4che`, o envio usa `JAVA_DIRECT` com `@argfile` (evita limitacao do `cmd`)
   - no `JAVA_DIRECT`, os argumentos do `@argfile` sao serializados com escape explicito de barra invertida para suportar paths Windows com espacos
   - pre-requisito Java para `JAVA_DIRECT`: recomendado `Java 17 LTS` (testado com `Temurin 17.0.18`)
   - download recomendado: `Eclipse Temurin (Adoptium)` em `https://adoptium.net/temurin/releases/?version=17`
-  - se `JAVA_DIRECT` nao estiver disponivel, o app usa fallback `CMD_BAT` e aplica guarda por tamanho real do comando
+  - no inicio do `Send`, o app executa health-check dos JARs criticos da toolkit (`dcm4che-tool-storescu`, `dcm4che-tool-common`, `dcm4che-net`, `dcm4che-core`)
+  - se o Java nao estiver funcional ou se faltar JAR critico, o envio falha explicitamente (sem fallback silencioso para `.bat`)
   - na analise, `batch_max_cmd` continua sendo salvo em `analysis_summary.csv` para rastreabilidade
   - o campo de batch e ajustado automaticamente para esse teto quando a analise termina e quando um `run_id` e selecionado no `Send`
   - voce pode reduzir manualmente; se tentar aumentar acima do teto, o app ajusta de volta e registra `[BATCH_LIMIT_GUARD]`
-  - no fallback `CMD_BAT`, antes do envio o app divide chunks automaticamente quando a linha de comando excede o limite seguro (split preventivo)
   - em `dcmtk`, essa limitacao de linha de comando nao e aplicada para arquivos (uso de `@args`)
+- Atualizacao de IUID (dcm4che)
+  - `REALTIME` (padrao): registra IUID por arquivo assim que cada resposta `C-STORE-RSP` chega no chunk
+  - `CHUNK_END`: mantem o comportamento de consolidar status/IUID ao final de cada chunk
+- Checkpoint de envio
+  - em modos por arquivo (`dcm4che` com `MANIFEST_FILES` e `dcmtk`), o checkpoint e salvo por item processado (retomada mais robusta)
+  - no modo `dcm4che + FOLDERS`, o cursor de retomada continua por unidade de pasta (limitacao natural do envio por pasta)
+  - em retomadas, a numeracao de chunk continua a partir do maior `chunk_no` ja registrado no `send_results_by_file.csv` (evita sobrescrever `batch_*.txt/javaargs` e traces de comando)
+  - no `dcmtk`, o progresso de itens e a escrita de `send_results_by_file.csv` tambem ocorrem em tempo real durante o chunk (coerente com checkpoint por item)
 - Regras de indexacao por extensao
   - lista separada por virgula, ex.: `.dcm,.ima,.dicom`
   - opcao `Nao restringir por extensao (incluir todos os arquivos)` (desmarcada por padrao)
@@ -158,6 +166,17 @@ Na aba `Send`, a visualizacao de log e separada em dois canais:
 - `Exibir output bruto da toolkit (tempo real)`
 
 E possivel combinar esses controles com o filtro de tela (`Todos`, `Sistema`, `Warnings + Erros`) sem alterar os arquivos de log em disco.
+
+Detalhes de performance do filtro de log:
+- o refresh usa debounce por painel com token de geracao (descarta resultados obsoletos em alternancias rapidas);
+- a filtragem e preparada fora da thread de UI e a renderizacao ocorre em lotes na thread principal (modelo seguro para Tkinter);
+- alternancias repetidas podem reaproveitar cache de visualizacao para reduzir latencia.
+
+Semantica de `SENT_UNKNOWN` (diagnostico):
+- `dcm4che`: em `NO_MATCH`, o `status_detail` inclui `uid_source=...` e, sem correlacao forte com `rq/ok/err`, a UID nao e persistida (`uid_persisted=NO`) para evitar ambiguidade;
+- `dcmtk`: `SENT_UNKNOWN` recebe `status_detail` diagnostico por padrao (`parse_status=UNKNOWN;reason=no_match_in_output`) e pode ser enriquecido com causa tecnica quando detectada no output.
+
+Na aba `Send`, o botao `Novo run` limpa o `run_id` selecionado e leva para a aba `Analise` com o campo `Run ID (opcional)` em branco (fluxo guiado para iniciar novo run).
 
 ## Versionamento
 
