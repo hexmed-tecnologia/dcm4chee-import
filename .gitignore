@@ -8,3 +8,7 @@ dcmtk-*/
 **/dcmtk-*/
 python-multi/runs/
 python-multi/build-scripts/dist/
+.env
+.env.local
+**/.env
+**/.env.local
