@@ -12,8 +12,12 @@ from app.domain.constants import (
     DCMTK_STORE_FAILED_FILE_RE,
     DCMTK_STORE_FAILED_REASON_RE,
     DCMTK_STORE_RSP_RE,
+    MEDIA_STORAGE_DIRECTORY_STORAGE_UID,
+    TAG_0004_1220_RE,
     UID_TAG_0002_0010,
+    UID_TAG_0002_0002,
     UID_TAG_0008_0018,
+    UID_TAG_0008_0016,
 )
 from app.shared.utils import hidden_process_kwargs, normalize_uid_candidate
 
@@ -254,3 +258,71 @@ def get_driver(toolkit: str) -> ToolkitDriver:
     if toolkit == "dcmtk":
         return DcmtkDriver()
     return Dcm4cheDriver()
+
+
+def inspect_dicomdir_candidate(cfg: AppConfig, file_path: Path) -> dict:
+    """
+    Inspect a file named DICOMDIR and decide if it is a media directory index.
+
+    Returns a dict with:
+      - checked: bool
+      - is_directory_index: bool
+      - media_storage_sop_class_uid: str
+      - sop_class_uid: str
+      - has_directory_record_sequence: bool
+      - error: str
+    """
+    out = {
+        "checked": False,
+        "is_directory_index": False,
+        "media_storage_sop_class_uid": "",
+        "sop_class_uid": "",
+        "has_directory_record_sequence": False,
+        "error": "",
+    }
+    toolkit = (cfg.toolkit or "").strip().lower()
+    if toolkit not in {"dcm4che", "dcmtk"}:
+        out["error"] = f"unsupported_toolkit:{toolkit or 'empty'}"
+        return out
+
+    if toolkit == "dcmtk":
+        if not cfg.dcmtk_bin_path:
+            out["error"] = "dcmdump.exe nao encontrado na toolkit interna"
+            return out
+        dcmdump = Path(cfg.dcmtk_bin_path) / "dcmdump.exe"
+        if not dcmdump.exists():
+            out["error"] = f"dcmdump.exe nao encontrado: {dcmdump}"
+            return out
+        cmd = [str(dcmdump), str(file_path)]
+    else:
+        if not cfg.dcm4che_bin_path:
+            out["error"] = "dcmdump.bat nao encontrado na toolkit interna"
+            return out
+        dcmdump = Path(cfg.dcm4che_bin_path) / "dcmdump.bat"
+        if not dcmdump.exists():
+            out["error"] = f"dcmdump.bat nao encontrado: {dcmdump}"
+            return out
+        cmd = ["cmd", "/c", str(dcmdump), str(file_path)]
+
+    try:
+        raw = get_driver(toolkit).dcmdump_text(cmd)
+    except Exception as ex:
+        out["error"] = str(ex)
+        return out
+
+    out["checked"] = True
+    media_m = UID_TAG_0002_0002.search(raw)
+    sop_m = UID_TAG_0008_0016.search(raw)
+    media_uid = normalize_uid_candidate(media_m.group(1) if media_m else "")
+    sop_uid = normalize_uid_candidate(sop_m.group(1) if sop_m else "")
+    has_dir_seq = bool(TAG_0004_1220_RE.search(raw))
+
+    out["media_storage_sop_class_uid"] = media_uid
+    out["sop_class_uid"] = sop_uid
+    out["has_directory_record_sequence"] = has_dir_seq
+    out["is_directory_index"] = (
+        media_uid == MEDIA_STORAGE_DIRECTORY_STORAGE_UID
+        or sop_uid == MEDIA_STORAGE_DIRECTORY_STORAGE_UID
+        or has_dir_seq
+    )
+    return out

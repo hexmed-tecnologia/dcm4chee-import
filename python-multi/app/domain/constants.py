@@ -26,7 +26,11 @@ DCMTK_STORE_FAILED_FILE_RE = re.compile(r"E:\s+Store Failed,\s*file:\s+(.+?):\s*
 DCMTK_STORE_FAILED_REASON_RE = re.compile(r"E:\s+([0-9A-F]{4}:[0-9A-F]{4}\s+.+)$", re.IGNORECASE)
 UID_TAG_0008_0018 = re.compile(r"\(0008,0018\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
 UID_TAG_0002_0010 = re.compile(r"\(0002,0010\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
+UID_TAG_0002_0002 = re.compile(r"\(0002,0002\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
+UID_TAG_0008_0016 = re.compile(r"\(0008,0016\)[^\[]*\[([^\]]*)\]", re.IGNORECASE)
+TAG_0004_1220_RE = re.compile(r"\(0004,1220\)", re.IGNORECASE)
 UID_VALUE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)+")
+MEDIA_STORAGE_DIRECTORY_STORAGE_UID = "1.2.840.10008.1.3.10"
 IS_WINDOWS = os.name == "nt"
 WINDOWS_CMD_SAFE_MAX_CHARS = 7600
 WINDOWS_DIRECT_SAFE_MAX_CHARS = 30000

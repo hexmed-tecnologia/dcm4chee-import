@@ -13,6 +13,7 @@ from app.infra.run_artifacts import (
     write_csv_row,
     write_telemetry_event,
 )
+from app.integrations.toolkit_drivers import inspect_dicomdir_candidate
 from app.shared.utils import (
     WorkflowCancelled,
     _windows_cmdline_arg_len,
@@ -205,6 +206,32 @@ class AnalyzeWorkflow:
                             else:
                                 include = True
                                 reason = "INCLUDED_ALL_FILES"
+
+                            # Guardrail: only exclude DICOMDIR when we can confirm it is
+                            # a Media Storage Directory object (directory index).
+                            if include and entry.name.upper() == "DICOMDIR":
+                                dicomdir_info = inspect_dicomdir_candidate(self.cfg, Path(entry.path))
+                                if dicomdir_info.get("checked") and dicomdir_info.get("is_directory_index"):
+                                    include = False
+                                    reason = "EXCLUDED_DICOMDIR_INDEX"
+                                    self._log(
+                                        "[DICOMDIR_EXCLUDED] "
+                                        f"path={entry.path} media_uid={dicomdir_info.get('media_storage_sop_class_uid', '') or 'N/A'} "
+                                        f"sop_uid={dicomdir_info.get('sop_class_uid', '') or 'N/A'} "
+                                        f"has_dir_seq={1 if dicomdir_info.get('has_directory_record_sequence') else 0}"
+                                    )
+                                elif dicomdir_info.get("checked"):
+                                    self._log(
+                                        "[DICOMDIR_NAME_BUT_NOT_INDEX] "
+                                        f"path={entry.path} media_uid={dicomdir_info.get('media_storage_sop_class_uid', '') or 'N/A'} "
+                                        f"sop_uid={dicomdir_info.get('sop_class_uid', '') or 'N/A'} "
+                                        f"has_dir_seq={1 if dicomdir_info.get('has_directory_record_sequence') else 0}"
+                                    )
+                                else:
+                                    self._log(
+                                        "[DICOMDIR_CHECK_FAILED] "
+                                        f"path={entry.path} error={dicomdir_info.get('error', 'UNKNOWN')}"
+                                    )
                             if include:
                                 selected_files += 1
                                 selected_bytes += size_actual
