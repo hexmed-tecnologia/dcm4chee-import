@@ -5,6 +5,21 @@ Aplicacao desktop em Tkinter para fluxo DICOM com dois toolkits:
 - `dcm4che-tools`
 - `DCMTK`
 
+## Arquitetura de codigo (modular)
+
+A aplicacao foi migrada do modelo monolitico para um modelo modular, mantendo paridade funcional.
+
+- `app.py`: entrypoint minimo (inicializa `App`).
+- `app/config/`: configuracao e modelo `AppConfig`.
+- `app/domain/`: constantes e regex de dominio.
+- `app/shared/`: utilitarios reutilizaveis (tempo, UIDs, normalizacoes, etc.).
+- `app/infra/`: persistencia em CSV e resolucao de paths/artefatos de run.
+- `app/integrations/`: drivers de toolkit (`dcm4che`/`dcmtk`).
+- `app/workflows/`: fluxos de negocio (`analyze`, `send`, `validation`).
+- `app/ui/`: interface Tkinter (`app_window` e `config_dialog`).
+
+Observacao: a migracao foi feita com foco em compatibilidade de comportamento. O layout de artefatos, logs e regras de negocio foi preservado.
+
 ## Abas principais
 
 - `Analise`
