@@ -2,10 +2,12 @@
 # Usa apenas Git + PowerShell + API do GitHub (nao precisa do gh).
 # Requer: token do GitHub (env GITHUB_TOKEN, -Token, ou arquivo .env na pasta do script).
 # Uso: .\upload_zips_to_releases.ps1
+#      .\upload_zips_to_releases.ps1 -t v2.3.0
 #      Ou defina GITHUB_TOKEN no .env: GITHUB_TOKEN=ghp_xxx (arquivo .env nao vai pro git).
 
 param(
     [string]$DistPath = "",
+    [Alias("t")]
     [string[]]$Tags = @(),
     [string]$Token = ""
 )
