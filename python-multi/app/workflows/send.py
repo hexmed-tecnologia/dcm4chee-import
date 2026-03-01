@@ -308,6 +308,8 @@ class SendWorkflow:
             )
         done_files = min(done_files, total_items)
         is_resuming = (done_units > 0) or (send_unit_is_file_mode and done_files > 0)
+        resume_cursor = done_files if send_unit_is_file_mode else done_units
+        resume_label = f"sim (cursor inicial={resume_cursor})" if is_resuming else "nao"
 
         if not is_resuming:
             for filename in [
@@ -574,6 +576,8 @@ class SendWorkflow:
                 attempt_chunks_total,
                 chunk_index,
                 total_chunks,
+                is_resuming,
+                resume_label,
             )
             split_info = ""
             if split_total > 1:
@@ -778,6 +782,8 @@ class SendWorkflow:
                     attempt_chunks_total,
                     chunk_index,
                     total_chunks,
+                    is_resuming,
+                    resume_label,
                 )
                 _write_send_checkpoint("ITEM", file_path_s)
 
@@ -942,6 +948,8 @@ class SendWorkflow:
                     attempt_chunks_total,
                     chunk_index,
                     total_chunks,
+                    is_resuming,
+                    resume_label,
                 )
                 _write_send_checkpoint("ITEM", file_path_s)
                 self._log(
@@ -1244,6 +1252,8 @@ class SendWorkflow:
                         attempt_chunks_total,
                         chunk_index,
                         total_chunks,
+                        is_resuming,
+                        resume_label,
                     )
                     _write_send_checkpoint("ITEM", fp)
             else:
@@ -1326,6 +1336,8 @@ class SendWorkflow:
                         attempt_chunks_total,
                         chunk_index,
                         total_chunks,
+                        is_resuming,
+                        resume_label,
                     )
                     _write_send_checkpoint("ITEM", fp)
             unit_cursor += len(batch_inputs)

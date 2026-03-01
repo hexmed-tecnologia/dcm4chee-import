@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class AppConfig:
-    toolkit: str = "dcm4che"
+    toolkit: str = "dcmtk"
     # Internal runtime values (always resolved from local "toolkits" folder).
     dcm4che_bin_path: str = ""
     dcmtk_bin_path: str = ""

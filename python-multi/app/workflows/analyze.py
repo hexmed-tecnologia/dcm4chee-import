@@ -13,7 +13,7 @@ from app.infra.run_artifacts import (
     write_csv_row,
     write_telemetry_event,
 )
-from app.integrations.toolkit_drivers import inspect_dicomdir_candidate
+from app.integrations.toolkit_drivers import apply_internal_toolkit_paths, inspect_dicomdir_candidate
 from app.shared.utils import (
     WorkflowCancelled,
     _windows_cmdline_arg_len,
@@ -25,9 +25,13 @@ from app.shared.utils import (
     now_dual_timestamp,
     now_run_id,
     parse_extensions,
+    read_app_version,
     strip_known_run_suffixes,
     toolkit_run_suffix,
 )
+
+
+DICOMDIR_GUARD_MARKER = "DICOMDIR_GUARD_MARKER_20260228_R1"
 
 
 class AnalyzeWorkflow:
@@ -91,6 +95,26 @@ class AnalyzeWorkflow:
         summary = resolve_run_artifact_path(run_dir, "analysis_summary.csv", for_write=True, logger=self._log)
         events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
 
+        # Keep toolkit paths synchronized with the runtime bundle before DICOMDIR inspection.
+        apply_internal_toolkit_paths(self.cfg, script_dir, self._log)
+
+        app_version = read_app_version(script_dir)
+        dcmtk_bin = (self.cfg.dcmtk_bin_path or "").strip()
+        dcmdump_exists = "0"
+        if dcmtk_bin:
+            dcmdump_exists = "1" if (Path(dcmtk_bin) / "dcmdump.exe").exists() else "0"
+        write_telemetry_event(
+            events,
+            run,
+            "ANALYSIS_BUILD_MARKER",
+            "Marcador de build/runtime para diagnostico DICOMDIR.",
+            (
+                f"marker={DICOMDIR_GUARD_MARKER};"
+                f"app_version={app_version};toolkit={self.cfg.toolkit};"
+                f"analyze_file={__file__};dcmtk_bin={dcmtk_bin or 'N/A'};dcmdump_exists={dcmdump_exists}"
+            ),
+        )
+
         allowed_ext = parse_extensions(self.cfg.allowed_extensions_csv)
         include_no_ext = bool(self.cfg.include_no_extension)
         restrict_extensions = bool(self.cfg.restrict_extensions)
@@ -149,6 +173,38 @@ class AnalyzeWorkflow:
         dirs_discovered = 1
         dir_stack: list[Path] = [root]
         scan_errors = 0
+        dicomdir_candidates = 0
+        dicomdir_excluded = 0
+        dicomdir_invalid = 0
+        dicomdir_not_index = 0
+        dicomdir_check_failed = 0
+
+        def _safe_event_value(value: str, limit: int = 260) -> str:
+            txt = str(value or "N/A")
+            txt = txt.replace("\r", "\\r").replace("\n", "\\n").replace(";", ",")
+            if len(txt) > limit:
+                txt = txt[: limit - 3] + "..."
+            return txt
+
+        def _is_invalid_dicomdir_candidate(info: dict) -> bool:
+            rc = str(info.get("dcmdump_returncode", "")).strip()
+            rc_invalid = bool(rc and rc != "0")
+            output_blob = (
+                str(info.get("dcmdump_stderr_excerpt", "") or "")
+                + "\n"
+                + str(info.get("dcmdump_stdout_excerpt", "") or "")
+            ).lower()
+            parse_invalid_markers = [
+                "non-standard vr",
+                "dataset not in ascending tag order",
+                "premature end of stream",
+                "i/o suspension",
+                "cannot determine transfer syntax",
+                "invalid dicom",
+                "parse error",
+            ]
+            parse_invalid = any(marker in output_blob for marker in parse_invalid_markers)
+            return rc_invalid or parse_invalid
 
         with manifest_files.open("w", newline="", encoding="utf-8") as f_manifest:
             manifest_writer = csv.DictWriter(f_manifest, fieldnames=file_output_fields, delimiter=CSV_SEP)
@@ -210,28 +266,64 @@ class AnalyzeWorkflow:
                             # Guardrail: only exclude DICOMDIR when we can confirm it is
                             # a Media Storage Directory object (directory index).
                             if include and entry.name.upper() == "DICOMDIR":
+                                dicomdir_candidates += 1
                                 dicomdir_info = inspect_dicomdir_candidate(self.cfg, Path(entry.path))
                                 if dicomdir_info.get("checked") and dicomdir_info.get("is_directory_index"):
                                     include = False
                                     reason = "EXCLUDED_DICOMDIR_INDEX"
+                                    dicomdir_excluded += 1
                                     self._log(
                                         "[DICOMDIR_EXCLUDED] "
                                         f"path={entry.path} media_uid={dicomdir_info.get('media_storage_sop_class_uid', '') or 'N/A'} "
                                         f"sop_uid={dicomdir_info.get('sop_class_uid', '') or 'N/A'} "
                                         f"has_dir_seq={1 if dicomdir_info.get('has_directory_record_sequence') else 0}"
                                     )
+                                    dicomdir_decision = "EXCLUDED_DICOMDIR_INDEX"
+                                elif dicomdir_info.get("checked") and _is_invalid_dicomdir_candidate(dicomdir_info):
+                                    include = False
+                                    reason = "EXCLUDED_DICOMDIR_INVALID"
+                                    dicomdir_invalid += 1
+                                    self._log(
+                                        "[DICOMDIR_EXCLUDED_INVALID] "
+                                        f"path={entry.path} dcmdump_rc={dicomdir_info.get('dcmdump_returncode', 'N/A') or 'N/A'} "
+                                        f"stderr={_safe_event_value(dicomdir_info.get('dcmdump_stderr_excerpt', '') or 'N/A')}"
+                                    )
+                                    dicomdir_decision = "EXCLUDED_DICOMDIR_INVALID"
                                 elif dicomdir_info.get("checked"):
+                                    dicomdir_not_index += 1
                                     self._log(
                                         "[DICOMDIR_NAME_BUT_NOT_INDEX] "
                                         f"path={entry.path} media_uid={dicomdir_info.get('media_storage_sop_class_uid', '') or 'N/A'} "
                                         f"sop_uid={dicomdir_info.get('sop_class_uid', '') or 'N/A'} "
                                         f"has_dir_seq={1 if dicomdir_info.get('has_directory_record_sequence') else 0}"
                                     )
+                                    dicomdir_decision = "INCLUDED_DICOMDIR_NOT_INDEX"
                                 else:
+                                    dicomdir_check_failed += 1
                                     self._log(
                                         "[DICOMDIR_CHECK_FAILED] "
                                         f"path={entry.path} error={dicomdir_info.get('error', 'UNKNOWN')}"
                                     )
+                                    dicomdir_decision = "INCLUDED_DICOMDIR_CHECK_FAILED"
+                                write_telemetry_event(
+                                    events,
+                                    run,
+                                    "ANALYSIS_DICOMDIR_DECISION",
+                                    "DICOMDIR avaliado.",
+                                    (
+                                        f"marker={DICOMDIR_GUARD_MARKER};path={entry.path};decision={dicomdir_decision};"
+                                        f"checked={1 if dicomdir_info.get('checked') else 0};"
+                                        f"is_directory_index={1 if dicomdir_info.get('is_directory_index') else 0};"
+                                        f"media_uid={dicomdir_info.get('media_storage_sop_class_uid', '') or 'N/A'};"
+                                        f"sop_uid={dicomdir_info.get('sop_class_uid', '') or 'N/A'};"
+                                        f"has_dir_seq={1 if dicomdir_info.get('has_directory_record_sequence') else 0};"
+                                        f"error={_safe_event_value(dicomdir_info.get('error', '') or 'N/A')};"
+                                        f"dcmdump_rc={_safe_event_value(dicomdir_info.get('dcmdump_returncode', '') or 'N/A', 16)};"
+                                        f"dcmdump_cmd={_safe_event_value(dicomdir_info.get('dcmdump_command', '') or 'N/A', 220)};"
+                                        f"dcmdump_stdout={_safe_event_value(dicomdir_info.get('dcmdump_stdout_excerpt', '') or 'N/A')};"
+                                        f"dcmdump_stderr={_safe_event_value(dicomdir_info.get('dcmdump_stderr_excerpt', '') or 'N/A')}"
+                                    ),
+                                )
                             if include:
                                 selected_files += 1
                                 selected_bytes += size_actual
@@ -391,6 +483,17 @@ class AnalyzeWorkflow:
                 f"collect_size_bytes={'1' if self.cfg.collect_size_bytes else '0'};"
                 f"batch_max_cmd={batch_max_cmd or 'N/A'};batch_max_cmd_source={batch_max_cmd_source};"
                 f"analysis_duration_sec={analysis_duration_sec}"
+            ),
+        )
+        write_telemetry_event(
+            events,
+            run,
+            "ANALYSIS_DICOMDIR_SUMMARY",
+            "Resumo DICOMDIR na analise.",
+            (
+                f"marker={DICOMDIR_GUARD_MARKER};candidates={dicomdir_candidates};"
+                f"excluded={dicomdir_excluded};invalid={dicomdir_invalid};"
+                f"not_index={dicomdir_not_index};check_failed={dicomdir_check_failed}"
             ),
         )
 

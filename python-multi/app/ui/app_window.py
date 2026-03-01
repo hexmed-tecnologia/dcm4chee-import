@@ -27,6 +27,40 @@ from app.workflows.send import SendWorkflow
 from app.workflows.validation import ValidationWorkflow
 
 
+class _SimpleTooltip:
+    def __init__(self, widget: tk.Widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip_window: tk.Toplevel | None = None
+        self.widget.bind("<Enter>", self._show)
+        self.widget.bind("<Leave>", self._hide)
+
+    def _show(self, _event=None):
+        if self.tip_window is not None:
+            return
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        lbl = ttk.Label(
+            tip,
+            text=self.text,
+            relief="solid",
+            borderwidth=1,
+            padding=(6, 4),
+            justify="left",
+        )
+        lbl.pack()
+        self.tip_window = tip
+
+    def _hide(self, _event=None):
+        if self.tip_window is None:
+            return
+        self.tip_window.destroy()
+        self.tip_window = None
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -41,7 +75,7 @@ class App(tk.Tk):
         self.cancel_event = threading.Event()
 
         self.progress_items_var = tk.StringVar(value="enviando item 0 de 0")
-        self.progress_chunks_var = tk.StringVar(value="batch chunk 0 de 0 | retomada #0")
+        self.progress_chunks_var = tk.StringVar(value="batch chunk 0 de 0 | retomada: nao")
         self.analysis_progress_var = tk.StringVar(value="progresso analise: aguardando")
         self.log_filter_options = ["Todos", "Sistema", "Warnings + Erros"]
         self.var_log_filter_an = tk.StringVar(value="Todos")
@@ -102,6 +136,8 @@ class App(tk.Tk):
         new_mode = normalize_dcm4che_send_mode(cfg.dcm4che_send_mode)
         mode_changed = (prev_toolkit != new_toolkit) or (prev_toolkit == "dcm4che" and prev_mode != new_mode)
 
+        # Config dialog does not expose toolkit paths; always re-resolve before persisting.
+        apply_internal_toolkit_paths(cfg, self.base_dir)
         self.config_obj = cfg
         self.config_file.write_text(json.dumps(asdict(cfg), ensure_ascii=True, indent=2), encoding="utf-8")
         self.var_batch_size.set(str(cfg.batch_size_default))
@@ -120,12 +156,12 @@ class App(tk.Tk):
         if mode_changed:
             self.var_run_id.set("")
             self._log_an(
-                "[RUN_ID_RESET] toolkit/modo alterado; Run ID (opcional) limpo para evitar sufixo incorreto."
+                "[RUN_ID_RESET] toolkit/modo alterado; Run ID limpo para evitar sufixo incorreto."
             )
             messagebox.showinfo(
                 "Configuracao atualizada",
                 "Toolkit/modo de envio alterado.\n\n"
-                "O campo 'Run ID (opcional)' foi limpo para evitar sufixo incorreto. "
+                "O campo 'Run ID' foi limpo para evitar sufixo incorreto. "
                 "Nao e necessario reiniciar o sistema.",
                 parent=self,
             )
@@ -170,9 +206,14 @@ class App(tk.Tk):
         ttk.Label(top, text="Pasta exames").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_exam_root, width=90).grid(row=0, column=1, sticky="we", padx=6)
         ttk.Button(top, text="...", width=3, command=self._browse_exam_root).grid(row=0, column=2)
-        ttk.Label(top, text="Batch size (dcm4che=folders/files conforme modo | dcmtk=arquivos)").grid(row=1, column=0, sticky="w")
+        lbl_batch = ttk.Label(top, text="Batch size")
+        lbl_batch.grid(row=1, column=0, sticky="w")
+        self._batch_size_tooltip = _SimpleTooltip(
+            lbl_batch,
+            "dcm4che: folders/files conforme modo | dcmtk: arquivos",
+        )
         ttk.Entry(top, textvariable=self.var_batch_size, width=12).grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Label(top, text="Run ID (opcional)").grid(row=2, column=0, sticky="w")
+        ttk.Label(top, text="Run ID").grid(row=2, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.var_run_id, width=28).grid(row=2, column=1, sticky="w", padx=6)
         btns = ttk.Frame(top)
         btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -423,6 +464,18 @@ class App(tk.Tk):
         finally:
             self._batch_size_trace_guard = False
 
+    def _persist_last_batch_used(self, batch: int) -> None:
+        if batch < 1:
+            return
+        if int(self.config_obj.batch_size_default) == batch:
+            return
+        self.config_obj.batch_size_default = batch
+        try:
+            self.config_file.write_text(json.dumps(asdict(self.config_obj), ensure_ascii=True, indent=2), encoding="utf-8")
+            self._log_an(f"[CFG_BATCH_LAST_USED] batch_size_default atualizado para {batch}.")
+        except Exception as ex:
+            self._log_an(f"[WARN] Falha ao persistir batch_size_default={batch}: {ex}")
+
     def _on_batch_size_changed(self, *_args) -> None:
         if self._batch_size_trace_guard:
             return
@@ -551,6 +604,10 @@ class App(tk.Tk):
         except Exception:
             messagebox.showerror("Erro", "Batch size invalido.")
             return
+        if batch < 1:
+            messagebox.showerror("Erro", "Batch size invalido.")
+            return
+        self._persist_last_batch_used(batch)
         run_id = self.var_run_id.get().strip()
         self.cancel_event.clear()
         self._log_an("Iniciando analise...")
@@ -618,7 +675,7 @@ class App(tk.Tk):
         self.cancel_event.clear()
         self._log_send("Iniciando envio...")
         self.progress_items_var.set("enviando item 0 de 0")
-        self.progress_chunks_var.set("batch chunk 0 de 0 | retomada #0")
+        self.progress_chunks_var.set("batch chunk 0 de 0 | retomada: nao")
         show_output = bool(self.var_show_output.get())
         self._set_activity_context("Send")
         self._set_activity_running(True)
@@ -630,6 +687,8 @@ class App(tk.Tk):
             attempt_chunk_total,
             tech_chunk_no,
             tech_chunk_total,
+            is_resuming,
+            resume_label,
         ):
             self.queue.put(
                 (
@@ -641,6 +700,8 @@ class App(tk.Tk):
                         attempt_chunk_total,
                         tech_chunk_no,
                         tech_chunk_total,
+                        is_resuming,
+                        resume_label,
                     ),
                 )
             )
@@ -1131,9 +1192,12 @@ class App(tk.Tk):
                         f"- duracao analise: {format_duration_sec(float(payload.get('analysis_duration_sec') or 0))}"
                     )
                 elif event == "send_progress":
-                    done, total, cno, ctot, tech_no, _tech_total = payload
+                    done, total, cno, ctot, _tech_no, _tech_total, is_resuming, resume_label = payload
                     self.progress_items_var.set(f"enviando item {done} de {total}")
-                    self.progress_chunks_var.set(f"batch chunk {cno} de {ctot} | retomada #{tech_no}")
+                    if is_resuming:
+                        self.progress_chunks_var.set(f"batch chunk {cno} de {ctot} | retomada: {resume_label}")
+                    else:
+                        self.progress_chunks_var.set(f"batch chunk {cno} de {ctot} | retomada: nao")
                 elif event == "send_done":
                     status = payload.get("status")
                     send_duration = payload.get("send_duration_sec")

@@ -279,6 +279,10 @@ def inspect_dicomdir_candidate(cfg: AppConfig, file_path: Path) -> dict:
         "sop_class_uid": "",
         "has_directory_record_sequence": False,
         "error": "",
+        "dcmdump_returncode": "",
+        "dcmdump_stdout_excerpt": "",
+        "dcmdump_stderr_excerpt": "",
+        "dcmdump_command": "",
     }
     toolkit = (cfg.toolkit or "").strip().lower()
     if toolkit not in {"dcm4che", "dcmtk"}:
@@ -305,7 +309,14 @@ def inspect_dicomdir_candidate(cfg: AppConfig, file_path: Path) -> dict:
         cmd = ["cmd", "/c", str(dcmdump), str(file_path)]
 
     try:
-        raw = get_driver(toolkit).dcmdump_text(cmd)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False, **hidden_process_kwargs())
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        out["dcmdump_returncode"] = str(proc.returncode)
+        out["dcmdump_stdout_excerpt"] = stdout[:1200]
+        out["dcmdump_stderr_excerpt"] = stderr[:1200]
+        out["dcmdump_command"] = " ".join(str(x) for x in cmd)
+        raw = ((stdout + "\n" + stderr).strip())
     except Exception as ex:
         out["error"] = str(ex)
         return out
