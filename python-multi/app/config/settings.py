@@ -22,6 +22,7 @@ class AppConfig:
     ts_mode: str = "AUTO"
     dcm4che_send_mode: str = "MANIFEST_FILES"
     dcm4che_iuid_update_mode: str = "REALTIME"
+    storescu_log_rotate_max_mb: int = 512
     # Prefer direct Java launcher with @argfile on Windows to avoid cmd line-length bottlenecks.
     dcm4che_prefer_java_direct: bool = True
     # Internal flag: keep Windows-stable wrapper for .bat execution by default.

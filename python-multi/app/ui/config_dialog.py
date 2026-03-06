@@ -28,6 +28,7 @@ class ConfigDialog(tk.Toplevel):
         self.var_dcm4che_iuid_update_mode = tk.StringVar(
             value=normalize_dcm4che_iuid_update_mode(config.dcm4che_iuid_update_mode)
         )
+        self.var_storescu_log_rotate_max_mb = tk.StringVar(value=str(int(config.storescu_log_rotate_max_mb)))
 
         frm = ttk.Frame(self, padding=12)
         frm.grid(sticky="nsew")
@@ -62,9 +63,10 @@ class ConfigDialog(tk.Toplevel):
             state="readonly",
         )
         self.cmb_dcm4che_iuid_mode.grid(row=7, column=1, sticky="we", pady=3)
+        self._row_entry(frm, 8, "Rotacao do storescu log (MB)", self.var_storescu_log_rotate_max_mb)
 
         self.filter_frame = ttk.LabelFrame(frm, text="Filtro de arquivos para analise", padding=8)
-        self.filter_frame.grid(row=8, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.filter_frame.grid(row=9, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.filter_frame.columnconfigure(1, weight=1)
         self.chk_include_all = ttk.Checkbutton(
             self.filter_frame,
@@ -88,11 +90,11 @@ class ConfigDialog(tk.Toplevel):
             frm,
             text="Calcular size_bytes na analise (mais lento)",
             variable=self.var_collect_size,
-        ).grid(row=9, column=0, columnspan=2, sticky="w")
+        ).grid(row=10, column=0, columnspan=2, sticky="w")
         self._toggle_dcm4che_controls()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=10, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btns.grid(row=11, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btns, text="Testar Echo", command=self._test_echo).pack(side="left", padx=4)
         ttk.Button(btns, text="Salvar", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Fechar", command=self.destroy).pack(side="left", padx=4)
@@ -147,6 +149,9 @@ class ConfigDialog(tk.Toplevel):
         self._toggle_extension_controls()
 
     def _build_config(self) -> AppConfig:
+        storescu_log_rotate_max_mb = int(self.var_storescu_log_rotate_max_mb.get().strip())
+        if storescu_log_rotate_max_mb < 1:
+            raise ValueError("Rotacao do storescu log (MB) deve ser >= 1.")
         return AppConfig(
             toolkit=self.var_toolkit.get().strip(),
             aet_origem=self.var_aet_src.get().strip(),
@@ -162,6 +167,7 @@ class ConfigDialog(tk.Toplevel):
             ts_mode=self._base_config.ts_mode,
             dcm4che_send_mode=normalize_dcm4che_send_mode(self.var_dcm4che_send_mode.get().strip()),
             dcm4che_iuid_update_mode=normalize_dcm4che_iuid_update_mode(self.var_dcm4che_iuid_update_mode.get().strip()),
+            storescu_log_rotate_max_mb=storescu_log_rotate_max_mb,
         )
 
     def _test_echo(self):

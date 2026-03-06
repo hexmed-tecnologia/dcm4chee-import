@@ -341,6 +341,39 @@ class SendWorkflow:
                     fp.unlink()
         chunk_cmd_dir.mkdir(parents=True, exist_ok=True)
 
+        try:
+            storescu_log_rotate_max_mb = max(1, int(getattr(self.cfg, "storescu_log_rotate_max_mb", 512)))
+        except Exception:
+            storescu_log_rotate_max_mb = 512
+        storescu_log_rotate_max_bytes = storescu_log_rotate_max_mb * 1024 * 1024
+        storescu_log_rotation_seq = 0
+        log_rotate_count = 0
+        log_flush_calls_total = 0
+
+        def _next_rotated_storescu_log_path() -> Path:
+            nonlocal storescu_log_rotation_seq
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            while True:
+                storescu_log_rotation_seq += 1
+                rotated = log_file.with_name(f"{log_file.name}.{ts}.{storescu_log_rotation_seq:06d}")
+                if not rotated.exists():
+                    return rotated
+
+        self._log(
+            f"[LOG_ROTATE_CONFIG] file={log_file} max_mb={storescu_log_rotate_max_mb} "
+            f"max_bytes={storescu_log_rotate_max_bytes} retention=ALL compression=OFF"
+        )
+        write_telemetry_event(
+            events,
+            run,
+            "LOG_ROTATE_CONFIG",
+            "Configuracao de rotacao do storescu log aplicada.",
+            (
+                f"file={log_file};max_mb={storescu_log_rotate_max_mb};"
+                f"max_bytes={storescu_log_rotate_max_bytes};retention=ALL;compression=OFF"
+            ),
+        )
+
         if self.cfg.toolkit == "dcm4che":
             self._log(
                 f"[SEND_EXEC_MODE] toolkit=dcm4che mode={dcm4che_exec_mode} reason={dcm4che_exec_reason}"
@@ -519,6 +552,7 @@ class SendWorkflow:
             f"iuid_mode={dcm4che_iuid_update_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
             f"exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
         )
+        self._log("[UI_THROTTLE_APPLIED] panel=send status=OFF reason=feature_not_enabled")
 
         sent_ok = 0
         warned = 0
@@ -691,6 +725,8 @@ class SendWorkflow:
             realtime_stream_buffer = ""
             realtime_stream_buffer_max_chars = 200000
             warning_statuses = {"NON_DICOM", "UNSUPPORTED_DICOM_OBJECT", "SENT_UNKNOWN"}
+            chunk_flush_calls = 0
+            backpressure_warn_emitted = False
 
             def _write_realtime_iuid_row(
                 *,
@@ -957,7 +993,12 @@ class SendWorkflow:
                     f"processed_items={item_cursor}/{total_items} file={file_path_s}"
                 )
 
-            with log_file.open("a", encoding="utf-8", errors="replace") as lf:
+            lf = log_file.open("a", encoding="utf-8", errors="replace")
+            try:
+                log_bytes_current = log_file.stat().st_size if log_file.exists() else 0
+            except Exception:
+                log_bytes_current = 0
+            try:
                 self.current_proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -999,8 +1040,63 @@ class SendWorkflow:
                             break
                         clean = line.rstrip("\n")
                         lines.append(clean)
+                        if (not backpressure_warn_emitted) and len(lines) >= 100000:
+                            backpressure_warn_emitted = True
+                            self._log(
+                                f"[BACKPRESSURE_WARN] chunk={chunk_index}/{total_chunks} "
+                                f"lines_buffered={len(lines)} mode=BUFFERED_PARSER"
+                            )
+                        line_size = len(line.encode("utf-8", errors="replace"))
+                        if IS_WINDOWS and line.endswith("\n"):
+                            line_size += 1
+                        if log_bytes_current > 0 and (log_bytes_current + line_size) > storescu_log_rotate_max_bytes:
+                            try:
+                                lf.flush()
+                            except Exception:
+                                pass
+                            try:
+                                lf.close()
+                            except Exception:
+                                pass
+                            rotated_path = _next_rotated_storescu_log_path()
+                            rotate_error = ""
+                            rotate_ok = False
+                            try:
+                                log_file.rename(rotated_path)
+                                rotate_ok = True
+                            except Exception as ex:
+                                rotate_error = str(ex)
+                            lf = log_file.open("a", encoding="utf-8", errors="replace")
+                            try:
+                                log_bytes_current = log_file.stat().st_size if log_file.exists() else 0
+                            except Exception:
+                                log_bytes_current = 0
+                            if rotate_ok:
+                                log_rotate_count += 1
+                                self._log(
+                                    f"[LOG_ROTATE] status=OK file={log_file.name} "
+                                    f"rotated_to={rotated_path.name} max_bytes={storescu_log_rotate_max_bytes}"
+                                )
+                                write_telemetry_event(
+                                    events,
+                                    run,
+                                    "LOG_ROTATE",
+                                    "storescu_execucao.log rotacionado por tamanho.",
+                                    (
+                                        f"chunk_no={chunk_index};file={log_file};rotated_to={rotated_path};"
+                                        f"max_bytes={storescu_log_rotate_max_bytes}"
+                                    ),
+                                )
+                            else:
+                                self._log(
+                                    f"[LOG_ROTATE] status=FAIL file={log_file.name} "
+                                    f"error={rotate_error or 'unknown'}"
+                                )
                         lf.write(line)
                         lf.flush()
+                        chunk_flush_calls += 1
+                        log_flush_calls_total += 1
+                        log_bytes_current += line_size
                         if realtime_iuid_enabled:
                             _process_realtime_stream_line(clean)
                         elif dcmtk_realtime_enabled:
@@ -1042,6 +1138,11 @@ class SendWorkflow:
                     cancel_watcher_stop.set()
                     cancel_watcher_thread.join(timeout=1.2)
                     self.current_proc = None
+            finally:
+                try:
+                    lf.close()
+                except Exception:
+                    pass
             if interrupted:
                 self._log(
                     f"[SEND_CANCELLED_IMMEDIATE] chunk={chunk_index}/{total_chunks} "
@@ -1067,6 +1168,10 @@ class SendWorkflow:
                     parse_exception_by_file.setdefault(current_scan_file, []).append(ln.strip())
 
             parsed = self.driver.parse_send_output(lines, batch_inputs)
+            self._log(
+                f"[STREAM_PARSE_STATS] chunk={chunk_index}/{total_chunks} "
+                f"parser_mode=BUFFERED lines_buffered={len(lines)}"
+            )
             if self.cfg.toolkit == "dcm4che":
                 batch_info = parsed.get("__batch__", {})
                 rq_iuid_list = [sanitize_uid(x) for x in batch_info.get("rq_iuids", []) if sanitize_uid(x)]
@@ -1342,6 +1447,9 @@ class SendWorkflow:
                     _write_send_checkpoint("ITEM", fp)
             unit_cursor += len(batch_inputs)
             _write_send_checkpoint("CHUNK_SYNC")
+            self._log(
+                f"[LOG_FLUSH_STATS] chunk={chunk_index}/{total_chunks} mode=PER_LINE flush_calls={chunk_flush_calls}"
+            )
             write_telemetry_event(
                 events,
                 run,
@@ -1419,6 +1527,10 @@ class SendWorkflow:
         self._log(
             f"[SEND_RESULT] ok={aggregated_sent_ok} warn={aggregated_warn} fail={aggregated_fail} status={final_status} "
             f"duration={format_duration_sec(send_duration_sec)}"
+        )
+        self._log(
+            f"[LOG_FLUSH_STATS] scope=run mode=PER_LINE flush_calls={log_flush_calls_total} "
+            f"log_rotations={log_rotate_count}"
         )
         if aggregated_warn > 0:
             self._log(

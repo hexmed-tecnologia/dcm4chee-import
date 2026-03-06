@@ -126,6 +126,10 @@ class App(tk.Tk):
         cfg.runs_base_dir = ""
         cfg.dcm4che_send_mode = normalize_dcm4che_send_mode(cfg.dcm4che_send_mode)
         cfg.dcm4che_iuid_update_mode = normalize_dcm4che_iuid_update_mode(cfg.dcm4che_iuid_update_mode)
+        try:
+            cfg.storescu_log_rotate_max_mb = max(1, int(cfg.storescu_log_rotate_max_mb))
+        except Exception:
+            cfg.storescu_log_rotate_max_mb = 512
         apply_internal_toolkit_paths(cfg, self.base_dir)
         return cfg
 
@@ -150,7 +154,8 @@ class App(tk.Tk):
             f"include_no_extension={'ON' if cfg.include_no_extension else 'OFF'} "
             f"collect_size_bytes={'ON' if cfg.collect_size_bytes else 'OFF'} "
             f"dcm4che_send_mode={cfg.dcm4che_send_mode} "
-            f"dcm4che_iuid_update_mode={cfg.dcm4che_iuid_update_mode}"
+            f"dcm4che_iuid_update_mode={cfg.dcm4che_iuid_update_mode} "
+            f"storescu_log_rotate_max_mb={cfg.storescu_log_rotate_max_mb}"
         )
         self._log_an("Configuracoes atualizadas.")
         if mode_changed:
