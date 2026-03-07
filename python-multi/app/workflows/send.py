@@ -342,9 +342,9 @@ class SendWorkflow:
         chunk_cmd_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            storescu_log_rotate_max_mb = max(1, int(getattr(self.cfg, "storescu_log_rotate_max_mb", 512)))
+            storescu_log_rotate_max_mb = max(1, int(getattr(self.cfg, "storescu_log_rotate_max_mb", 250)))
         except Exception:
-            storescu_log_rotate_max_mb = 512
+            storescu_log_rotate_max_mb = 250
         storescu_log_rotate_max_bytes = storescu_log_rotate_max_mb * 1024 * 1024
         storescu_log_rotation_seq = 0
         log_rotate_count = 0

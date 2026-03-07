@@ -18,7 +18,9 @@ from app.shared.utils import (
     hidden_process_kwargs,
     normalize_dcm4che_iuid_update_mode,
     normalize_dcm4che_send_mode,
+    now_run_id,
     read_app_version,
+    toolkit_run_suffix,
     WorkflowCancelled,
 )
 from app.ui.config_dialog import ConfigDialog
@@ -129,7 +131,7 @@ class App(tk.Tk):
         try:
             cfg.storescu_log_rotate_max_mb = max(1, int(cfg.storescu_log_rotate_max_mb))
         except Exception:
-            cfg.storescu_log_rotate_max_mb = 512
+            cfg.storescu_log_rotate_max_mb = 250
         apply_internal_toolkit_paths(cfg, self.base_dir)
         return cfg
 
@@ -223,6 +225,7 @@ class App(tk.Tk):
         btns = ttk.Frame(top)
         btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(btns, text="Analisar Pasta", command=self._start_analysis).pack(side="left", padx=4)
+        ttk.Button(btns, text="Novo run", command=self._new_run_from_analysis).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancelar", command=self._cancel_current_job).pack(side="left", padx=4)
 
         dash = ttk.LabelFrame(self.tab_an, text="Dashboard de Analise", padding=10)
@@ -276,7 +279,6 @@ class App(tk.Tk):
         self.cmb_send_runs.grid(row=0, column=1, sticky="w", padx=6)
         self.cmb_send_runs.bind("<<ComboboxSelected>>", lambda _e: self._on_send_run_selected())
         ttk.Button(top, text="Atualizar", command=self._refresh_run_list).grid(row=0, column=2, padx=4)
-        ttk.Button(top, text="Novo run", command=self._new_run_from_send).grid(row=0, column=3, padx=4)
         ttk.Checkbutton(
             top,
             text="Exibir mensagens internas do sistema",
@@ -511,6 +513,116 @@ class App(tk.Tk):
         rows = read_csv_rows(summary)
         return rows[-1] if rows else {}
 
+    def _read_run_send_summary(self, run_id: str) -> dict:
+        rid = (run_id or "").strip()
+        if not rid:
+            return {}
+        run_dir = self._runs_base() / rid
+        if not run_dir.exists():
+            return {}
+        summary = resolve_run_artifact_path(run_dir, "send_summary.csv", for_write=False)
+        if not summary.exists():
+            return {}
+        rows = read_csv_rows(summary)
+        return rows[-1] if rows else {}
+
+    def _is_send_summary_complete(self, row: dict) -> bool:
+        if not row:
+            return False
+        status = str(row.get("status", "")).strip().upper()
+        total_items = self._safe_int(row.get("total_items", 0), 0)
+        items_processed = self._safe_int(row.get("items_processed", 0), 0)
+        if total_items > 0:
+            return items_processed >= total_items and status != "INTERRUPTED"
+        return status in {"PASS", "PASS_WITH_WARNINGS", "FAIL"}
+
+    def _allocate_new_run_id(self) -> str:
+        runs_base = self._runs_base()
+        runs_base.mkdir(parents=True, exist_ok=True)
+        base = now_run_id()
+        suffix = toolkit_run_suffix(self.config_obj.toolkit, self.config_obj.dcm4che_send_mode)
+        seq = 0
+        while True:
+            base_candidate = base if seq == 0 else f"{base}_{seq:02d}"
+            candidate = f"{base_candidate}_{suffix}"
+            if not (runs_base / candidate).exists():
+                return candidate
+            seq += 1
+
+    def _start_new_run_context(self, *, origin: str, create_dir: bool) -> str:
+        run_id = self._allocate_new_run_id()
+        if create_dir:
+            run_dir = self._runs_base() / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+        self.var_send_run.set("")
+        self.var_run_id.set(run_id)
+        self._batch_size_max_cmd_limit = None
+        self._batch_size_max_cmd_source = ""
+        self._refresh_run_list()
+        self._log_send(
+            f"[RUN_NEW] origin={origin} run_id={run_id} send_run_cleared=YES created_dir={'YES' if create_dir else 'NO'}"
+        )
+        self._log_an(f"[RUN_NEW] run_id={run_id} pronto_para_analise=YES")
+        try:
+            self.nb.select(self.tab_an)
+        except Exception:
+            pass
+        return run_id
+
+    def _ask_analysis_decision_for_existing_run(self, run_id: str) -> str:
+        resp = messagebox.askyesnocancel(
+            "Run ja analisado",
+            (
+                f"O run '{run_id}' ja possui analise concluida.\n\n"
+                "Deseja fazer uma nova analise para esse run?\n\n"
+                "Sim: refazer analise no mesmo run\n"
+                "Nao: iniciar um novo run\n"
+                "Cancelar: nao executar analise"
+            ),
+            parent=self,
+        )
+        if resp is None:
+            return "CANCEL"
+        if resp:
+            return "REANALYZE_SAME_RUN"
+        return "NEW_RUN"
+
+    def _ask_send_decision_for_existing_summary(self, run_id: str, row: dict) -> str:
+        status = str(row.get("status", "")).strip() or "N/A"
+        total_items = self._safe_int(row.get("total_items", 0), 0)
+        items_processed = self._safe_int(row.get("items_processed", 0), 0)
+        if self._is_send_summary_complete(row):
+            resp = messagebox.askyesnocancel(
+                "Send ja concluido",
+                (
+                    f"O send do run '{run_id}' ja esta completo (status: {status}).\n\n"
+                    "Sim: iniciar novo run (obrigatorio analisar novamente)\n"
+                    "Nao: cancelar\n"
+                    "Cancelar: cancelar"
+                ),
+                parent=self,
+            )
+            if resp:
+                return "NEW_RUN"
+            return "CANCEL"
+
+        resp = messagebox.askyesnocancel(
+            "Send incompleto",
+            (
+                f"O send do run '{run_id}' ainda esta incompleto "
+                f"(status: {status}; itens: {items_processed}/{total_items}).\n\n"
+                "Sim: reiniciar o send de onde parou (sem limpar logs)\n"
+                "Nao: iniciar novo run (obrigatorio analisar novamente)\n"
+                "Cancelar: nao iniciar send"
+            ),
+            parent=self,
+        )
+        if resp is None:
+            return "CANCEL"
+        if resp:
+            return "RESUME_SAME_RUN"
+        return "NEW_RUN"
+
     def _get_run_batch_max_cmd(self, run_id: str) -> tuple[int | None, str]:
         row = self._read_run_analysis_summary(run_id)
         if not row:
@@ -614,6 +726,17 @@ class App(tk.Tk):
             return
         self._persist_last_batch_used(batch)
         run_id = self.var_run_id.get().strip()
+        if run_id and self._read_run_analysis_summary(run_id):
+            previous_run_id = run_id
+            decision = self._ask_analysis_decision_for_existing_run(run_id)
+            if decision == "CANCEL":
+                self._log_an(f"[ANALYSIS_RESTART_DECISION] run_id={run_id} action=CANCEL")
+                return
+            if decision == "NEW_RUN":
+                run_id = self._start_new_run_context(origin="analysis_existing_run_prompt", create_dir=True)
+                self._log_an(f"[ANALYSIS_RESTART_DECISION] previous_run={previous_run_id} action=NEW_RUN")
+            else:
+                self._log_an(f"[ANALYSIS_RESTART_DECISION] run_id={run_id} action=REANALYZE_SAME_RUN")
         self.cancel_event.clear()
         self._log_an("Iniciando analise...")
         self.analysis_progress_var.set("progresso analise: iniciando...")
@@ -651,6 +774,17 @@ class App(tk.Tk):
         except Exception:
             messagebox.showerror("Erro", "Batch size invalido.")
             return
+        send_summary_row = self._read_run_send_summary(run_id)
+        if send_summary_row:
+            decision = self._ask_send_decision_for_existing_summary(run_id, send_summary_row)
+            if decision == "CANCEL":
+                self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} action=CANCEL")
+                return
+            if decision == "NEW_RUN":
+                self._start_new_run_context(origin="send_summary_prompt", create_dir=True)
+                self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} action=NEW_RUN")
+                return
+            self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} action=RESUME_SAME_RUN")
         if (self.config_obj.toolkit or "").strip().lower() == "dcm4che":
             self._apply_batch_limit_for_run(run_id, notify=False, auto_set=False)
             limit = self._batch_size_max_cmd_limit
@@ -728,20 +862,17 @@ class App(tk.Tk):
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
 
+    def _new_run_from_analysis(self):
+        if self._worker_busy():
+            messagebox.showwarning("Em execucao", "Ha um processo em execucao. Aguarde ou cancele antes de iniciar novo run.")
+            return
+        self._start_new_run_context(origin="analysis_button", create_dir=True)
+
     def _new_run_from_send(self):
         if self._worker_busy():
             messagebox.showwarning("Em execucao", "Ha um processo em execucao. Aguarde ou cancele antes de iniciar novo run.")
             return
-        self.var_send_run.set("")
-        self.var_run_id.set("")
-        self._batch_size_max_cmd_limit = None
-        self._batch_size_max_cmd_source = ""
-        self._log_send("[RUN_NEW] Novo run solicitado na aba Send; selecao atual de run foi limpa.")
-        self._log_an("[RUN_NEW] Pronto para nova analise. Informe pasta e execute 'Analisar Pasta'.")
-        try:
-            self.nb.select(self.tab_an)
-        except Exception:
-            pass
+        self._start_new_run_context(origin="send_button_legacy", create_dir=True)
 
     def _start_validation(self):
         if self._worker_busy():
