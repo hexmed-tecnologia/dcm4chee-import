@@ -221,9 +221,11 @@ class App(tk.Tk):
         )
         ttk.Entry(top, textvariable=self.var_batch_size, width=12).grid(row=1, column=1, sticky="w", padx=6)
         ttk.Label(top, text="Run ID").grid(row=2, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.var_run_id, width=28).grid(row=2, column=1, sticky="w", padx=6)
+        self.cmb_an_runs = ttk.Combobox(top, textvariable=self.var_run_id, width=36)
+        self.cmb_an_runs.grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Button(top, text="Atualizar", command=self._refresh_run_list).grid(row=2, column=2, padx=4)
         btns = ttk.Frame(top)
-        btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        btns.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Button(btns, text="Analisar Pasta", command=self._start_analysis).pack(side="left", padx=4)
         ttk.Button(btns, text="Novo run", command=self._new_run_from_analysis).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancelar", command=self._cancel_current_job).pack(side="left", padx=4)
@@ -420,6 +422,7 @@ class App(tk.Tk):
         runs_base.mkdir(parents=True, exist_ok=True)
         runs = [p.name for p in runs_base.iterdir() if p.is_dir()]
         runs.sort(reverse=True)
+        self.cmb_an_runs["values"] = runs
         self.cmb_send_runs["values"] = runs
         self.cmb_val_runs["values"] = runs
         self.lst_runs.delete(0, tk.END)

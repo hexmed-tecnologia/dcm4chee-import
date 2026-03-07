@@ -353,9 +353,10 @@ class SendWorkflow:
         def _next_rotated_storescu_log_path() -> Path:
             nonlocal storescu_log_rotation_seq
             ts = time.strftime("%Y%m%d_%H%M%S")
+            base = log_file.stem
             while True:
                 storescu_log_rotation_seq += 1
-                rotated = log_file.with_name(f"{log_file.name}.{ts}.{storescu_log_rotation_seq:06d}")
+                rotated = log_file.with_name(f"{base}.{ts}.{storescu_log_rotation_seq:06d}.log")
                 if not rotated.exists():
                     return rotated
 

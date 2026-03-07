@@ -58,7 +58,8 @@ Cada `run_id` agora organiza os artefatos em subpastas:
   - `batch_args/`
 - `telemetry/`
   - `events.csv` (telemetria consolidada do run)
-  - `storescu_execucao.log`
+  - `storescu_execucao.log` (log ativo do storescu; quando atinge o limite de tamanho e rotacionado)
+  - arquivos rotacionados: `storescu_execucao.YYYYMMDD_HHMMSS.NNNNNN.log` (ex.: `storescu_execucao.20260307_091746.000001.log`)
   - `chunk_commands/` (dump do comando efetivo por chunk, incluindo modo de execucao)
 - `reports/`
   - `reconciliation_report.csv`
@@ -100,6 +101,17 @@ Exemplos práticos de leitura:
   - Marcadores de diagnostico no log: `[SEND_START]`, `[SEND_EXEC_MODE]`, `[JAVA_HEALTHCHECK]`, `[CHUNK_START]`, `[CHUNK_CMD]`, `[SEND_CHECKPOINT_ITEM]`, `[SEND_CANCEL_REQUEST]`, `[SEND_CANCEL_FORCE_KILL]`, `[SEND_CANCELLED_IMMEDIATE]`, `[SEND_IUID_REALTIME]`, `[SEND_IUID_RT_MATCH]`, `[SEND_IUID_RT_MISS]`, `[DCMTK_RT_PROGRESS]`, `[DCMTK_RT_ITEM_WRITE]`, `[DCMTK_RT_CHECKPOINT]`, `[CHUNK_END]`, `[SEND_END]`, `[SEND_PARSE_MISMATCH]`, `[SEND_UID_SOURCE]`, `[DCMTK_STATUS_DETAIL_ENRICHED]`, `[RUN_ID_GUARD]`, `[BATCH_AUTO_MAX]`, `[BATCH_LIMIT_GUARD]`, `[LOG_FILTER_CHANGE]`, `[LOG_REFRESH_START]`, `[LOG_REFRESH_BATCH]`, `[LOG_REFRESH_CANCELLED]`, `[LOG_REFRESH_END]`, `[LOG_BUFFER_TRIM]`
 - Consistência/validação: `CONSISTENCY_FILLED`, `CONSISTENCY_MISSING`
 - Execução sem trabalho novo: `RUN_SEND_SKIP_ALREADY_COMPLETED`
+
+### Rotacao do log do storescu (`storescu_execucao.log`)
+
+Para evitar crescimento ilimitado do log em envios grandes, o arquivo ativo `telemetry/storescu_execucao.log` e rotacionado por tamanho:
+
+- **Limite padrao:** 250 MB por arquivo (configuravel em Configuracoes: "Rotacao do storescu log (MB)").
+- **Retencao:** todos os arquivos rotacionados sao mantidos (sem remocao automatica nem compressao).
+- **Formato do nome dos segmentos:** `storescu_execucao.YYYYMMDD_HHMMSS.NNNNNN.log`
+  - Exemplo: `storescu_execucao.20260307_091746.000001.log`, `storescu_execucao.20260307_091831.000002.log`
+- **Quando ocorre:** ao escrever uma nova linha, se o tamanho atual do arquivo ativo mais o tamanho da linha exceder o limite configurado, o arquivo ativo e renomeado para o formato acima e um novo `storescu_execucao.log` e aberto.
+- **Telemetria:** evento `LOG_ROTATE_CONFIG` no inicio do send; evento `LOG_ROTATE` a cada rotacao bem-sucedida (em `events.csv`).
 
 Exemplo de fluxo rápido no PowerShell:
 
@@ -164,6 +176,7 @@ No menu `Configuracao -> Configuracoes`:
   - opcao `Incluir arquivos sem extensao` (aplicada quando a restricao por extensao estiver ativa)
   - em `dcm4che + FOLDERS`, esse bloco fica inativo e a analise considera todos os arquivos para manter coerencia com o envio por pasta
 - Opcao de calcular `size_bytes` na analise (desmarcada por padrao para melhor performance)
+- Rotacao do storescu log (MB): limite em MB por arquivo de log ativo (padrao 250); arquivos rotacionados ficam com nome `storescu_execucao.YYYYMMDD_HHMMSS.NNNNNN.log`
 - Modo TS (`AUTO`, `JPEG_LS_LOSSLESS`, `UNCOMPRESSED_STANDARD`)
 
 Observacao: o campo `Runs base dir` nao e mais exibido na interface. O app usa o caminho local padrao `python-multi/runs`.
