@@ -1101,6 +1101,25 @@ class App(tk.Tk):
             ]
         ):
             return "log_system"
+        # Toolkit prefixes (dcmtk/dcm4che): E:/F: represent hard errors.
+        if up.startswith("E:") or up.startswith("F:") or up.startswith("SEVERE:"):
+            return "log_error"
+        if any(
+            marker in up
+            for marker in [
+                "BAD DICOM FILE",
+                "FAILED TO ADD DATA SET FROM FILE",
+                "FAILED TO SEND DATA SET",
+                "NO PRESENTATION CONTEXT",
+                "STORE RESPONSE (STATUS: A7",
+                "STORE RESPONSE (STATUS: A9",
+                "STORE RESPONSE (STATUS: C",
+            ]
+        ):
+            return "log_error"
+        # Toolkit warnings should be visible in warn/error filter.
+        if up.startswith("W:") or up.startswith("WARNING:"):
+            return "log_warn"
         if "[ERRO]" in up or "[ERROR]" in up or "TRACEBACK" in up or "EXCEPTION" in up or "RUNTIMEERROR" in up:
             return "log_error"
         if (
@@ -1147,7 +1166,9 @@ class App(tk.Tk):
             if source == "internal" and not show_send_internal:
                 return False
             if source == "toolkit" and not show_send_toolkit:
-                return False
+                # Keep critical diagnostics visible even with toolkit stream toggle OFF.
+                if not (mode == "Warnings + Erros" and tag in ["log_warn", "log_error"]):
+                    return False
         if mode == "Todos":
             return True
         if mode == "Sistema":
