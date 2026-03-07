@@ -51,12 +51,15 @@ if exist "%SPEC_DIR%" rmdir /s /q "%SPEC_DIR%"
 mkdir "%SPEC_DIR%"
 
 for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString(\"ddMMyyyy_HHmmss\")"') do set "BUILD_STAMP=%%i"
-set "DIST_DIR=%DIST_ROOT%\%BUILD_STAMP%"
+set "VERSION_DIR=%DIST_ROOT%\%OUTPUT_NAME%"
+set "DIST_DIR=%VERSION_DIR%\%BUILD_STAMP%"
+if not exist "%VERSION_DIR%" mkdir "%VERSION_DIR%"
 mkdir "%DIST_DIR%"
 
 echo [INFO] Build timestamp: %BUILD_STAMP%
 echo [INFO] App version: %APP_VERSION%
 echo [INFO] Output folder name: %OUTPUT_NAME%
+echo [INFO] Version dir: %VERSION_DIR%
 echo [INFO] Dist output: %DIST_DIR%
 
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::Now.ToUnixTimeSeconds()"') do set "BUILD_START=%%a"

@@ -51,6 +51,7 @@ Cada `run_id` agora organiza os artefatos em subpastas:
   - `manifest_files.csv`
   - `analysis_summary.csv`
   - `send_results_by_file.csv`
+  - `send_results_by_file_trace.csv` (sidecar de rastreabilidade de linhas do storescu)
   - `send_summary.csv`
   - `validation_results.csv`
   - `send_checkpoint_dcm4che_folders.json` ou `send_checkpoint_dcm4che_files.json` (quando toolkit = dcm4che)
@@ -170,6 +171,7 @@ No menu `Configuracao -> Configuracoes`:
   - no modo `dcm4che + FOLDERS`, o cursor de retomada continua por unidade de pasta (limitacao natural do envio por pasta)
   - em retomadas, a numeracao de chunk continua a partir do maior `chunk_no` ja registrado no `send_results_by_file.csv` (evita sobrescrever `batch_*.txt/javaargs` e traces de comando)
   - no `dcmtk`, o progresso de itens e a escrita de `send_results_by_file.csv` tambem ocorrem em tempo real durante o chunk (coerente com checkpoint por item)
+  - compatibilidade de schema: `send_results_by_file.csv` permanece canônico para retomada; detalhes de rastreabilidade de linha do `storescu` ficam no sidecar `send_results_by_file_trace.csv`
 - Regras de indexacao por extensao
   - lista separada por virgula, ex.: `.dcm,.ima,.dicom`
   - opcao `Nao restringir por extensao (incluir todos os arquivos)` (desmarcada por padrao)
@@ -177,6 +179,10 @@ No menu `Configuracao -> Configuracoes`:
   - em `dcm4che + FOLDERS`, esse bloco fica inativo e a analise considera todos os arquivos para manter coerencia com o envio por pasta
 - Opcao de calcular `size_bytes` na analise (desmarcada por padrao para melhor performance)
 - Rotacao do storescu log (MB): limite em MB por arquivo de log ativo (padrao 250); arquivos rotacionados ficam com nome `storescu_execucao.YYYYMMDD_HHMMSS.NNNNNN.log`
+- Opcao de pre-checagem DICOM antes do send (dcmtk, desmarcada por padrao):
+  - quando ligada, valida cada arquivo antes do envio (mais lento);
+  - apenas erros fatais sao pulados automaticamente e registrados como `SEND_FAIL`;
+  - warning de elemento duplicado `(0000,0000)` e apenas registrado para diagnostico (nao pula arquivo por padrao).
 - Modo TS (`AUTO`, `JPEG_LS_LOSSLESS`, `UNCOMPRESSED_STANDARD`)
 
 Observacao: o campo `Runs base dir` nao e mais exibido na interface. O app usa o caminho local padrao `python-multi/runs`.
@@ -203,6 +209,13 @@ Detalhes de performance do filtro de log:
 Semantica de `SENT_UNKNOWN` (diagnostico):
 - `dcm4che`: em `NO_MATCH`, o `status_detail` inclui `uid_source=...` e, sem correlacao forte com `rq/ok/err`, a UID nao e persistida (`uid_persisted=NO`) para evitar ambiguidade;
 - `dcmtk`: `SENT_UNKNOWN` recebe `status_detail` diagnostico por padrao (`parse_status=UNKNOWN;reason=no_match_in_output`) e pode ser enriquecido com causa tecnica quando detectada no output.
+
+Diagnostico `dcmtk` para linhas `Bad DICOM file`:
+- quando o parser mapeia o arquivo com confianca, o item e registrado em `send_results_by_file.csv` como `SEND_FAIL` (ex.: `bad_dicom|...`);
+- quando nao ha mapeamento 100% confiavel, o app registra em `events.csv` a `raw_line`, `storescu_line_no` e `probable_file` (seguindo sequencia do log) para rastreabilidade.
+- para eventos monitorados do `storescu` (`Sending file`, `Bad DICOM file`, `Store Response`), falhas de regex tambem geram evento em `events.csv` com `raw_line`, `storescu_line_no`, `mapped_file` (quando houver) e `probable_file`.
+- no `send_results_by_file_trace.csv` (sidecar), os eventos monitorados do `storescu` sao persistidos com `storescu_line_no`, `raw_line`, `mapped_file` e `probable_file` para diagnostico completo sem quebrar runs legados.
+- no `send_results_by_file.csv`, linhas com mapeamento de arquivo persistem `storescu_line_no` sempre que disponivel; em casos de regex miss com mapeamento confiavel, a linha crua e registrada no detalhe (`storescu_regex_miss_raw_line=...`), preservando compatibilidade com schema antigo.
 
 Na aba `Send`, o botao `Novo run` limpa o `run_id` selecionado e leva para a aba `Analise` com o campo `Run ID (opcional)` em branco (fluxo guiado para iniciar novo run).
 

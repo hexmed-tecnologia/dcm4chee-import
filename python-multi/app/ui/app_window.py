@@ -133,6 +133,8 @@ class App(tk.Tk):
             cfg.storescu_log_rotate_max_mb = max(1, int(cfg.storescu_log_rotate_max_mb))
         except Exception:
             cfg.storescu_log_rotate_max_mb = 250
+        raw_precheck = str(getattr(cfg, "send_precheck_before_send", False)).strip().lower()
+        cfg.send_precheck_before_send = raw_precheck in {"1", "true", "yes", "on"}
         apply_internal_toolkit_paths(cfg, self.base_dir)
         return cfg
 
@@ -158,7 +160,8 @@ class App(tk.Tk):
             f"collect_size_bytes={'ON' if cfg.collect_size_bytes else 'OFF'} "
             f"dcm4che_send_mode={cfg.dcm4che_send_mode} "
             f"dcm4che_iuid_update_mode={cfg.dcm4che_iuid_update_mode} "
-            f"storescu_log_rotate_max_mb={cfg.storescu_log_rotate_max_mb}"
+            f"storescu_log_rotate_max_mb={cfg.storescu_log_rotate_max_mb} "
+            f"send_precheck_before_send={'ON' if cfg.send_precheck_before_send else 'OFF'}"
         )
         self._log_an("Configuracoes atualizadas.")
         if mode_changed:
@@ -544,10 +547,100 @@ class App(tk.Tk):
         rows = read_csv_rows(summary)
         return rows[-1] if rows else {}
 
+    def _read_run_selected_files_for_send(self, run_dir: Path) -> set[str]:
+        manifest = resolve_run_artifact_path(run_dir, "manifest_files.csv", for_write=False)
+        if not manifest.exists():
+            return set()
+        selected: set[str] = set()
+        for row in read_csv_rows(manifest):
+            if str(row.get("selected_for_send", "0")).strip() != "1":
+                continue
+            file_path = str(row.get("file_path", "")).strip()
+            if file_path:
+                selected.add(file_path)
+        return selected
+
+    def _read_run_send_checkpoint_progress(self, run_dir: Path) -> tuple[bool, int]:
+        checkpoint_names = (
+            "send_checkpoint_dcm4che_files.json",
+            "send_checkpoint_dcm4che_folders.json",
+            "send_checkpoint_dcmtk.json",
+            "send_checkpoint.json",
+        )
+        has_checkpoint = False
+        done_files_max = 0
+        for filename in checkpoint_names:
+            cat_path, leg_path = run_artifact_variants(run_dir, filename)
+            for checkpoint_path in (cat_path, leg_path):
+                if not checkpoint_path.exists():
+                    continue
+                has_checkpoint = True
+                try:
+                    payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                done_files = self._safe_int(
+                    payload.get("done_files", payload.get("done_units", payload.get("done_items", 0))),
+                    0,
+                )
+                done_files_max = max(done_files_max, done_files)
+        return has_checkpoint, max(done_files_max, 0)
+
+    def _read_run_send_results_progress(self, run_dir: Path, selected_files: set[str]) -> tuple[bool, int]:
+        send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=False)
+        if not send_results.exists():
+            return False, 0
+        processed_files: set[str] = set()
+        for row in read_csv_rows(send_results):
+            file_path = str(row.get("file_path", "")).strip()
+            if not file_path:
+                continue
+            if selected_files and file_path not in selected_files:
+                continue
+            processed_files.add(file_path)
+        return True, len(processed_files)
+
+    def _infer_send_row_without_summary(self, run_id: str) -> dict:
+        rid = (run_id or "").strip()
+        if not rid:
+            return {}
+        run_dir = self._runs_base() / rid
+        if not run_dir.exists():
+            return {}
+        selected_files = self._read_run_selected_files_for_send(run_dir)
+        total_items = len(selected_files)
+        has_checkpoint, checkpoint_done_files = self._read_run_send_checkpoint_progress(run_dir)
+        has_results, results_done_files = self._read_run_send_results_progress(run_dir, selected_files)
+        if not has_checkpoint and not has_results:
+            return {}
+        items_processed = max(checkpoint_done_files, results_done_files)
+        is_complete = total_items > 0 and items_processed >= total_items
+        return {
+            "status": "INFERRED_COMPLETE_NO_SUMMARY" if is_complete else "INFERRED_INCOMPLETE_NO_SUMMARY",
+            "total_items": total_items,
+            "items_processed": items_processed,
+            "has_checkpoint": "1" if has_checkpoint else "0",
+            "has_results": "1" if has_results else "0",
+            "checkpoint_done_files": checkpoint_done_files,
+            "results_done_files": results_done_files,
+        }
+
+    def _format_send_status_for_prompt(self, status: str) -> str:
+        raw = str(status or "").strip().upper()
+        if raw == "INFERRED_COMPLETE_NO_SUMMARY":
+            return "COMPLETO (inferido sem send_summary)"
+        if raw == "INFERRED_INCOMPLETE_NO_SUMMARY":
+            return "INCOMPLETO (inferido sem send_summary)"
+        return raw or "N/A"
+
     def _is_send_summary_complete(self, row: dict) -> bool:
         if not row:
             return False
         status = str(row.get("status", "")).strip().upper()
+        if status == "INFERRED_COMPLETE_NO_SUMMARY":
+            return True
         total_items = self._safe_int(row.get("total_items", 0), 0)
         items_processed = self._safe_int(row.get("items_processed", 0), 0)
         if total_items > 0:
@@ -607,13 +700,20 @@ class App(tk.Tk):
 
     def _ask_send_decision_for_existing_summary(self, run_id: str, row: dict) -> str:
         status = str(row.get("status", "")).strip() or "N/A"
+        status_display = self._format_send_status_for_prompt(status)
         total_items = self._safe_int(row.get("total_items", 0), 0)
         items_processed = self._safe_int(row.get("items_processed", 0), 0)
+        inferred_note = ""
+        if status.startswith("INFERRED_"):
+            inferred_note = (
+                "Observacao: send_summary.csv nao encontrado; estado inferido por checkpoint/resultados.\n\n"
+            )
         if self._is_send_summary_complete(row):
             resp = messagebox.askyesnocancel(
                 "Send ja concluido",
                 (
-                    f"O send do run '{run_id}' ja esta completo (status: {status}).\n\n"
+                    f"O send do run '{run_id}' ja esta completo (status: {status_display}).\n\n"
+                    f"{inferred_note}"
                     "Sim: iniciar novo run (obrigatorio analisar novamente)\n"
                     "Nao: cancelar\n"
                     "Cancelar: cancelar"
@@ -628,7 +728,8 @@ class App(tk.Tk):
             "Send incompleto",
             (
                 f"O send do run '{run_id}' ainda esta incompleto "
-                f"(status: {status}; itens: {items_processed}/{total_items}).\n\n"
+                f"(status: {status_display}; itens: {items_processed}/{total_items}).\n\n"
+                f"{inferred_note}"
                 "Sim: reiniciar o send de onde parou (sem limpar logs)\n"
                 "Nao: iniciar novo run (obrigatorio analisar novamente)\n"
                 "Cancelar: nao iniciar send"
@@ -800,16 +901,29 @@ class App(tk.Tk):
             messagebox.showerror("Erro", "Batch size invalido.")
             return
         send_summary_row = self._read_run_send_summary(run_id)
+        decision_source = "send_summary"
+        if not send_summary_row:
+            inferred_row = self._infer_send_row_without_summary(run_id)
+            if inferred_row:
+                send_summary_row = inferred_row
+                decision_source = "inferred_no_summary"
         if send_summary_row:
+            self._log_send(
+                f"[SEND_HISTORY_DETECTED] run_id={run_id} source={decision_source} "
+                f"status={send_summary_row.get('status', 'N/A')} "
+                f"items={self._safe_int(send_summary_row.get('items_processed', 0), 0)}/"
+                f"{self._safe_int(send_summary_row.get('total_items', 0), 0)}"
+            )
             decision = self._ask_send_decision_for_existing_summary(run_id, send_summary_row)
             if decision == "CANCEL":
-                self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} action=CANCEL")
+                self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} source={decision_source} action=CANCEL")
                 return
             if decision == "NEW_RUN":
-                self._start_new_run_context(origin="send_summary_prompt", create_dir=True)
-                self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} action=NEW_RUN")
+                origin = "send_summary_prompt" if decision_source == "send_summary" else "send_inferred_prompt"
+                self._start_new_run_context(origin=origin, create_dir=True)
+                self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} source={decision_source} action=NEW_RUN")
                 return
-            self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} action=RESUME_SAME_RUN")
+            self._log_send(f"[SEND_RESTART_DECISION] run_id={run_id} source={decision_source} action=RESUME_SAME_RUN")
         if (self.config_obj.toolkit or "").strip().lower() == "dcm4che":
             self._apply_batch_limit_for_run(run_id, notify=False, auto_set=False)
             limit = self._batch_size_max_cmd_limit

@@ -149,6 +149,34 @@ def looks_like_dicom_payload_file(file_path: Path) -> bool:
     return False
 
 
+def parse_dcmtk_bad_dicom_line(line: str) -> tuple[str, str]:
+    prefix = "E: Bad DICOM file:"
+    raw = (line or "").strip()
+    if not raw.startswith(prefix):
+        return "", ""
+    payload = raw[len(prefix) :].strip()
+    if not payload:
+        return "", ""
+    # Windows paths contain drive letter ":" (e.g. G:\...), so split on ": " delimiter.
+    split_at = payload.find(": ")
+    if split_at > 0:
+        file_path = payload[:split_at].strip()
+        detail = payload[split_at + 2 :].strip()
+        if file_path and detail:
+            return file_path, detail
+    split_at = payload.rfind(":")
+    if split_at > 0:
+        file_path = payload[:split_at].strip()
+        detail = payload[split_at + 1 :].strip()
+        if file_path and detail:
+            return file_path, detail
+    return payload, ""
+
+
+def is_dcmtk_duplicate_element_warning(line: str) -> bool:
+    return "DcmItem: Element (0000,0000) found twice" in (line or "")
+
+
 def normalize_dcm4che_send_mode(mode: str) -> str:
     m = (mode or "").strip().upper()
     if m in ["FILES", "MANIFEST_FILES"]:

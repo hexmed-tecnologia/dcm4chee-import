@@ -6,7 +6,6 @@ from app.domain.constants import (
     DCM4CHE_STORE_RQ_RE,
     DCM4CHE_STORE_RSP_ERR_RE,
     DCM4CHE_STORE_RSP_OK_RE,
-    DCMTK_BAD_FILE_RE,
     DCMTK_NO_SOP_UID_RE,
     DCMTK_SENDING_FILE_RE,
     DCMTK_STORE_FAILED_FILE_RE,
@@ -19,7 +18,7 @@ from app.domain.constants import (
     UID_TAG_0008_0018,
     UID_TAG_0008_0016,
 )
-from app.shared.utils import hidden_process_kwargs, normalize_uid_candidate
+from app.shared.utils import hidden_process_kwargs, normalize_uid_candidate, parse_dcmtk_bad_dicom_line
 
 
 def find_toolkit_bin(base_dir: Path, toolkit_prefix: str, filename: str) -> str:
@@ -199,11 +198,10 @@ class DcmtkDriver(ToolkitDriver):
                 )
                 pending_failed_file = ""
                 continue
-            m_bad = DCMTK_BAD_FILE_RE.search(line)
-            if m_bad:
-                bad_file = m_bad.group(1).strip()
-                detail = m_bad.group(2).strip()
-                result[bad_file] = {"send_status": "NON_DICOM", "status_detail": detail}
+            bad_file, detail = parse_dcmtk_bad_dicom_line(line)
+            if bad_file:
+                detail = detail or "Bad DICOM file"
+                result[bad_file] = {"send_status": "SEND_FAIL", "status_detail": f"bad_dicom|{detail}"}
                 pending_failed_file = ""
                 continue
             m_no_sop = DCMTK_NO_SOP_UID_RE.search(line)

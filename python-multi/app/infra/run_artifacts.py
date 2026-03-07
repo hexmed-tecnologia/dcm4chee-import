@@ -57,6 +57,7 @@ RUN_ARTIFACT_SUBDIR: dict[str, str] = {
     "manifest_files.csv": RUN_SUBDIR_CORE,
     "analysis_summary.csv": RUN_SUBDIR_CORE,
     "send_results_by_file.csv": RUN_SUBDIR_CORE,
+    "send_results_by_file_trace.csv": RUN_SUBDIR_CORE,
     "send_summary.csv": RUN_SUBDIR_CORE,
     "validation_results.csv": RUN_SUBDIR_CORE,
     # Legacy core files (kept only for cleanup/fallback compatibility).

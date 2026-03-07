@@ -12,7 +12,6 @@ from app.domain.constants import (
     DCM4CHE_STORE_RQ_RE,
     DCM4CHE_STORE_RSP_ERR_RE,
     DCM4CHE_STORE_RSP_OK_RE,
-    DCMTK_BAD_FILE_RE,
     DCMTK_SENDING_FILE_RE,
     DCMTK_STORE_RSP_RE,
     IS_WINDOWS,
@@ -40,9 +39,11 @@ from app.shared.utils import (
     normalize_dcm4che_send_mode,
     normalize_uid_candidate,
     now_br,
+    parse_dcmtk_bad_dicom_line,
     resolve_java_executable,
     sanitize_uid,
     send_checkpoint_filename,
+    is_dcmtk_duplicate_element_warning,
 )
 
 
@@ -198,6 +199,64 @@ class SendWorkflow:
                 f.write("\n[java_args_file_content]\n")
                 f.write(java_args_file.read_text(encoding="utf-8", errors="replace"))
 
+    def _compact_ref_text(self, value: str, max_chars: int = 260) -> str:
+        raw = re.sub(r"\s+", " ", (value or "").strip())
+        if len(raw) <= max_chars:
+            return raw
+        return raw[: max_chars - 3] + "..."
+
+    def _dcmtk_precheck_dcmdump_path(self) -> Path | None:
+        if not self.cfg.dcmtk_bin_path:
+            return None
+        dcmdump = Path(self.cfg.dcmtk_bin_path) / "dcmdump.exe"
+        if not dcmdump.exists():
+            return None
+        return dcmdump
+
+    def _run_dcmtk_precheck(self, dcmdump_exe: Path, file_path: Path, timeout_sec: int = 8) -> tuple[bool, bool, str]:
+        cmd = [str(dcmdump_exe), "+P", "0008,0018", "+P", "0002,0010", str(file_path)]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+                **hidden_process_kwargs(),
+            )
+        except subprocess.TimeoutExpired:
+            return True, False, f"dcmdump_timeout={timeout_sec}s"
+        except Exception as ex:
+            return True, False, self._compact_ref_text(f"dcmdump_exception={ex}", max_chars=220)
+
+        out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        out_lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        has_duplicate_warning = any(is_dcmtk_duplicate_element_warning(ln) for ln in out_lines)
+        lower_out = out.lower()
+        fatal_markers = [
+            "bad dicom file",
+            "i/o suspension",
+            "premature end of stream",
+            "dicomstreamexception",
+            "eofexception",
+        ]
+        if proc.returncode != 0:
+            first_line = out_lines[0] if out_lines else ""
+            detail = f"dcmdump_exit={proc.returncode}"
+            if first_line:
+                detail += f";msg={self._compact_ref_text(first_line, max_chars=180)}"
+            return True, has_duplicate_warning, detail
+        if any(marker in lower_out for marker in fatal_markers):
+            marker_line = ""
+            for ln in out_lines:
+                ln_l = ln.lower()
+                if any(marker in ln_l for marker in fatal_markers):
+                    marker_line = ln
+                    break
+            detail = marker_line or "dcmdump_fatal_pattern_detected"
+            return True, has_duplicate_warning, self._compact_ref_text(detail, max_chars=220)
+        return False, has_duplicate_warning, ""
+
     def run_send(self, run_id: str, batch_size: int, show_output: bool = True) -> dict:
         send_start_ts = time.monotonic()
         # Keep original behavior from monolithic app.py where base dir was project root.
@@ -240,7 +299,8 @@ class SendWorkflow:
             f"dcm4che_send_mode={dcm4che_send_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
             f"dcm4che_iuid_update_mode={dcm4che_iuid_update_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
             f"dcm4che_exec_mode={dcm4che_exec_mode if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
-            f"dcm4che_exec_reason={dcm4che_exec_reason if self.cfg.toolkit == 'dcm4che' else 'N/A'}"
+            f"dcm4che_exec_reason={dcm4che_exec_reason if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
+            f"send_precheck_before_send={'ON' if bool(getattr(self.cfg, 'send_precheck_before_send', False)) else 'OFF'}"
         )
         self._log("[RUN_LAYOUT] mode=send layout=core|telemetry|reports")
 
@@ -254,6 +314,22 @@ class SendWorkflow:
         if total_items == 0:
             raise RuntimeError("Nenhum arquivo selecionado no manifesto para envio.")
         send_unit_is_file_mode = not (self.cfg.toolkit == "dcm4che" and dcm4che_send_mode == "FOLDERS")
+        send_precheck_enabled = (
+            bool(getattr(self.cfg, "send_precheck_before_send", False))
+            and self.cfg.toolkit == "dcmtk"
+            and send_unit_is_file_mode
+        )
+        dcmtk_precheck_dcmdump = self._dcmtk_precheck_dcmdump_path() if send_precheck_enabled else None
+        if send_precheck_enabled and dcmtk_precheck_dcmdump is None:
+            send_precheck_enabled = False
+            self._log(
+                "[SEND_PRECHECK] status=OFF reason=dcmdump_unavailable "
+                "hint=configure_dcmtk_bin_or_disable_precheck"
+            )
+        elif send_precheck_enabled:
+            self._log(
+                f"[SEND_PRECHECK] status=ON mode=DCMTK_FATAL_ONLY dcmdump={dcmtk_precheck_dcmdump}"
+            )
         folder_to_files: dict[str, list[Path]] = {}
         for r in selected_rows:
             folder = str(r.get("folder_path", "")).strip() or str(Path(r["file_path"]).parent)
@@ -315,6 +391,7 @@ class SendWorkflow:
             for filename in [
                 "storescu_execucao.log",
                 "send_results_by_file.csv",
+                "send_results_by_file_trace.csv",
                 "send_summary.csv",
             ]:
                 cleanup_run_artifact_variants(run_dir, filename)
@@ -331,9 +408,11 @@ class SendWorkflow:
         log_file = resolve_run_artifact_path(run_dir, "storescu_execucao.log", for_write=True, logger=self._log)
         events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
         send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
+        send_results_trace = resolve_run_artifact_path(run_dir, "send_results_by_file_trace.csv", for_write=True, logger=self._log)
         send_summary = resolve_run_artifact_path(run_dir, "send_summary.csv", for_write=True, logger=self._log)
         checkpoint = resolve_run_artifact_path(run_dir, checkpoint_name, for_write=True, logger=self._log)
         args_dir = resolve_run_batch_args_dir(run_dir, for_write=True, logger=self._log)
+        compat_sidecar_bootstrap = is_resuming and send_results_read.exists() and (not send_results_trace.exists())
         chunk_cmd_dir = run_dir / RUN_SUBDIR_TELEMETRY / "chunk_commands"
         if not is_resuming and chunk_cmd_dir.exists():
             for fp in chunk_cmd_dir.glob("*"):
@@ -374,6 +453,35 @@ class SendWorkflow:
                 f"max_bytes={storescu_log_rotate_max_bytes};retention=ALL;compression=OFF"
             ),
         )
+        write_telemetry_event(
+            events,
+            run,
+            "RUN_SEND_PRECHECK",
+            "Configuracao de pre-checagem do send aplicada.",
+            (
+                f"status={'ON' if send_precheck_enabled else 'OFF'};"
+                f"mode=DCMTK_FATAL_ONLY;"
+                f"toolkit={self.cfg.toolkit};"
+                f"dcmdump={dcmtk_precheck_dcmdump or 'N/A'}"
+            ),
+        )
+        if compat_sidecar_bootstrap:
+            self._log(
+                "[TODO_URGENTE_FUTURO] compat_mode=CANONICO_PLUS_SIDECAR "
+                "acao=unificar_sidecar_quando_runs_legadas_encerradas "
+                "motivo=preservar_retomada_da_run_legada_atual"
+            )
+            write_telemetry_event(
+                events,
+                run,
+                "TODO_URGENTE_FUTURO",
+                "Debito tecnico: unificar sidecar quando nao houver mais necessidade de compatibilidade legada.",
+                (
+                    f"scope=send_results_by_file_trace.csv;is_resuming=1;"
+                    f"canonical={send_results};sidecar={send_results_trace};"
+                    "reason=preservar_run_legada_atual_sem_perder_retomada"
+                ),
+            )
 
         if self.cfg.toolkit == "dcm4che":
             self._log(
@@ -528,12 +636,62 @@ class SendWorkflow:
             "ts_mode",
             "send_status",
             "status_detail",
+            "storescu_line_no",
+            "storescu_raw_line",
             "sop_instance_uid",
             "source_ts_uid",
             "source_ts_name",
             "extract_status",
             "processed_at",
         ]
+        trace_fields = [
+            "run_id",
+            "chunk_no",
+            "toolkit",
+            "event_kind",
+            "regex_ok",
+            "storescu_line_no",
+            "mapped_file",
+            "probable_file",
+            "mapped_confidence",
+            "status_hint",
+            "detail_hint",
+            "raw_line",
+            "processed_at",
+        ]
+
+        def _write_send_trace_row(
+            *,
+            chunk_no: int,
+            event_kind: str,
+            regex_ok: bool,
+            storescu_line_no: int,
+            mapped_file: str = "",
+            probable_file: str = "",
+            mapped_confidence: str = "NONE",
+            status_hint: str = "",
+            detail_hint: str = "",
+            raw_line: str = "",
+        ) -> None:
+            write_csv_row(
+                send_results_trace,
+                {
+                    "run_id": run,
+                    "chunk_no": chunk_no,
+                    "toolkit": self.cfg.toolkit,
+                    "event_kind": event_kind,
+                    "regex_ok": "1" if regex_ok else "0",
+                    "storescu_line_no": storescu_line_no if storescu_line_no > 0 else "",
+                    "mapped_file": mapped_file,
+                    "probable_file": probable_file,
+                    "mapped_confidence": mapped_confidence,
+                    "status_hint": status_hint,
+                    "detail_hint": self._compact_ref_text(detail_hint, max_chars=220),
+                    "raw_line": self._compact_ref_text((raw_line or "").replace(";", ","), max_chars=260),
+                    "processed_at": now_br(),
+                },
+                trace_fields,
+            )
 
         write_telemetry_event(
             events,
@@ -601,7 +759,102 @@ class SendWorkflow:
                 interrupted = True
                 break
             attempt_chunk_no = (chunk_index - chunk_start_index) + 1
+            original_batch_inputs = list(batch_inputs)
+            original_batch_files = list(batch_files)
+            if send_precheck_enabled and dcmtk_precheck_dcmdump is not None and self.cfg.toolkit == "dcmtk":
+                prechecked_inputs: list[Path] = []
+                prechecked_files: list[Path] = []
+                for file_path in batch_files:
+                    file_path_s = str(file_path)
+                    precheck_fatal, duplicate_warning, precheck_detail = self._run_dcmtk_precheck(
+                        dcmtk_precheck_dcmdump,
+                        file_path,
+                    )
+                    if duplicate_warning:
+                        self._log(
+                            f"[SEND_PRECHECK_DUP_WARN] chunk={chunk_index}/{total_chunks} file={file_path_s} "
+                            "action=REGISTER_ONLY"
+                        )
+                        write_telemetry_event(
+                            events,
+                            run,
+                            "SEND_PRECHECK_DUP_WARN",
+                            "Warning de elemento duplicado detectado na pre-checagem.",
+                            f"chunk_no={chunk_index};file_path={file_path_s};action=REGISTER_ONLY",
+                        )
+                    if precheck_fatal:
+                        detail_value = self._compact_ref_text(
+                            f"dcmdump_precheck_fatal|{precheck_detail or 'unknown'}",
+                            max_chars=220,
+                        )
+                        write_csv_row(
+                            send_results,
+                            {
+                                "run_id": run,
+                                "file_path": file_path_s,
+                                "chunk_no": chunk_index,
+                                "toolkit": self.cfg.toolkit,
+                                "ts_mode": ts_mode,
+                                "send_status": "SEND_FAIL",
+                                "status_detail": detail_value,
+                                "sop_instance_uid": "",
+                                "source_ts_uid": "",
+                                "source_ts_name": "",
+                                "extract_status": "PRECHECK_FATAL",
+                                "processed_at": now_br(),
+                            },
+                            result_fields,
+                        )
+                        write_telemetry_event(
+                            events,
+                            run,
+                            "SEND_PRECHECK_SKIP",
+                            "Arquivo marcado como falha fatal na pre-checagem e removido do envio.",
+                            f"chunk_no={chunk_index};file_path={file_path_s};reason={detail_value}",
+                        )
+                        failed += 1
+                        item_cursor += 1
+                        self.progress_callback(
+                            item_cursor,
+                            total_items,
+                            attempt_chunk_no,
+                            attempt_chunks_total,
+                            chunk_index,
+                            total_chunks,
+                            is_resuming,
+                            resume_label,
+                        )
+                        _write_send_checkpoint("ITEM", file_path_s)
+                        continue
+                    prechecked_inputs.append(file_path)
+                    prechecked_files.append(file_path)
+                batch_inputs = prechecked_inputs
+                batch_files = prechecked_files
+                if len(batch_files) != len(original_batch_files):
+                    self._log(
+                        f"[SEND_PRECHECK_FILTER] chunk={chunk_index}/{total_chunks} "
+                        f"before={len(original_batch_files)} after={len(batch_files)} "
+                        f"removed={len(original_batch_files) - len(batch_files)}"
+                    )
             batch_file_set = {str(x) for x in batch_files}
+            if not batch_files:
+                unit_cursor += len(original_batch_inputs)
+                _write_send_checkpoint("CHUNK_SYNC")
+                self._log(
+                    f"[CHUNK_SKIP_PRECHECK] chunk={chunk_index}/{total_chunks} "
+                    f"reason=all_items_filtered_by_precheck"
+                )
+                write_telemetry_event(
+                    events,
+                    run,
+                    "CHUNK_END",
+                    "Chunk sem itens apos pre-checagem.",
+                    (
+                        f"chunk_no={chunk_index};exit_code=SKIPPED_PRECHECK;"
+                        f"origin_chunk={original_chunk_no};split_pos={split_pos};split_total={split_total}"
+                    ),
+                )
+                continue
             first_item = item_cursor + 1
             last_item = min(item_cursor + len(batch_files), total_items)
             self.progress_callback(
@@ -717,6 +970,64 @@ class SendWorkflow:
             realtime_written_files: set[str] = set()
             dcmtk_written_files: set[str] = set()
             dcmtk_current_file = ""
+            storescu_stream_line_no = 0
+            dcmtk_ordered_files = [str(x) for x in batch_files]
+            dcmtk_last_line_no_by_file: dict[str, int] = {}
+            dcmtk_last_raw_line_by_file: dict[str, str] = {}
+            dcmtk_regex_miss_line_no_by_file: dict[str, int] = {}
+            dcmtk_regex_miss_raw_line_by_file: dict[str, str] = {}
+
+            def _dcmtk_guess_probable_file() -> str:
+                if (
+                    dcmtk_current_file
+                    and dcmtk_current_file in batch_file_set
+                    and dcmtk_current_file not in dcmtk_written_files
+                ):
+                    return dcmtk_current_file
+                for candidate in dcmtk_ordered_files:
+                    if candidate in batch_file_set and candidate not in dcmtk_written_files:
+                        return candidate
+                return ""
+
+            def _emit_dcmtk_regex_miss(
+                event_kind: str,
+                raw_line: str,
+                probable_file: str = "",
+                mapped_file: str = "",
+            ) -> None:
+                raw_line_ref = self._compact_ref_text((raw_line or "").replace(";", ","), max_chars=220)
+                probable = probable_file or mapped_file or _dcmtk_guess_probable_file()
+                confidence = "CONFIRMED" if (mapped_file and mapped_file in batch_file_set) else ("PROBABLE" if probable else "NONE")
+                if mapped_file and mapped_file in batch_file_set:
+                    dcmtk_regex_miss_line_no_by_file[mapped_file] = storescu_stream_line_no
+                    dcmtk_regex_miss_raw_line_by_file[mapped_file] = raw_line
+                _write_send_trace_row(
+                    chunk_no=chunk_index,
+                    event_kind=event_kind,
+                    regex_ok=False,
+                    storescu_line_no=storescu_stream_line_no,
+                    mapped_file=mapped_file if (mapped_file in batch_file_set) else "",
+                    probable_file=probable,
+                    mapped_confidence=confidence,
+                    detail_hint=event_kind,
+                    raw_line=raw_line,
+                )
+                write_telemetry_event(
+                    events,
+                    run,
+                    "SEND_DCMTK_REGEX_MISS",
+                    "Linha do storescu sem match em regex de evento monitorado.",
+                    (
+                        f"chunk_no={chunk_index};storescu_line_no={storescu_stream_line_no};"
+                        f"kind={event_kind};mapped_file={mapped_file or 'N/A'};"
+                        f"probable_file={probable or 'N/A'};raw_line={raw_line_ref}"
+                    ),
+                )
+                self._log(
+                    f"[DCMTK_REGEX_MISS] chunk={chunk_index}/{total_chunks} line={storescu_stream_line_no} "
+                    f"kind={event_kind} mapped_file={mapped_file or 'N/A'} probable_file={probable or 'N/A'}"
+                )
+
             realtime_payload_files = [str(x) for x in batch_files if looks_like_dicom_payload_file(x)]
             realtime_payload_cursor = 0
             realtime_file_by_iuid: dict[str, str] = {}
@@ -905,7 +1216,15 @@ class SendWorkflow:
                             f"iuid={rsp_err_iuid} status={rsp_err_status or 'UNKNOWN'} reason=file_mapping_not_found"
                         )
 
-            def _write_dcmtk_realtime_row(*, file_path_s: str, status_value: str, detail_value: str) -> None:
+            def _write_dcmtk_realtime_row(
+                *,
+                file_path_s: str,
+                status_value: str,
+                detail_value: str,
+                storescu_line_no_value: int = 0,
+                storescu_raw_line_value: str = "",
+                regex_fallback: bool = False,
+            ) -> None:
                 nonlocal item_cursor, sent_ok, warned, failed
                 if file_path_s in dcmtk_written_files:
                     return
@@ -920,12 +1239,20 @@ class SendWorkflow:
                 ts_name = ""
                 extract_status = ""
                 m_err = ""
+                metadata_exception = ""
                 try:
                     iuid, ts_uid, ts_name, m_err = self.driver.extract_metadata(self.cfg, Path(file_path_s))
                 except Exception as ex:
-                    m_err = str(ex)
+                    metadata_exception = str(ex)
+                    m_err = metadata_exception
 
-                if iuid:
+                if metadata_exception:
+                    status_value = "SEND_FAIL"
+                    extract_status = "METADATA_EXCEPTION"
+                    detail_value = (
+                        detail_value + " | dcmdump_exception=" + self._compact_ref_text(metadata_exception, max_chars=160)
+                    ).strip(" |")
+                elif iuid:
                     extract_status = "OK"
                 elif status_value == "SENT_OK":
                     extract_status = "MISSING_IUID"
@@ -933,6 +1260,30 @@ class SendWorkflow:
                     detail_value = (detail_value + " | " + m_err).strip(" |")
                 if status_value == "SENT_UNKNOWN" and not detail_value:
                     detail_value = "parse_status=UNKNOWN;reason=no_match_in_output"
+                if storescu_line_no_value <= 0:
+                    storescu_line_no_value = dcmtk_last_line_no_by_file.get(file_path_s, 0)
+                if storescu_line_no_value > 0:
+                    detail_value = (detail_value + f" | storescu_line_no={storescu_line_no_value}").strip(" |")
+                storescu_raw_line_ref = ""
+                if regex_fallback and storescu_raw_line_value:
+                    storescu_raw_line_ref = self._compact_ref_text(
+                        storescu_raw_line_value.replace(";", ","),
+                        max_chars=220,
+                    )
+                    detail_value = (detail_value + f" | storescu_raw_line={storescu_raw_line_ref}").strip(" |")
+                regex_miss_line_no = dcmtk_regex_miss_line_no_by_file.get(file_path_s, 0)
+                regex_miss_raw_ref = ""
+                if file_path_s in dcmtk_regex_miss_raw_line_by_file:
+                    regex_miss_raw_ref = self._compact_ref_text(
+                        dcmtk_regex_miss_raw_line_by_file[file_path_s].replace(";", ","),
+                        max_chars=220,
+                    )
+                if regex_miss_line_no > 0:
+                    detail_value = (detail_value + f" | storescu_regex_miss_line_no={regex_miss_line_no}").strip(" |")
+                if regex_miss_raw_ref:
+                    detail_value = (detail_value + f" | storescu_regex_miss_raw_line={regex_miss_raw_ref}").strip(" |")
+                    if not storescu_raw_line_ref:
+                        storescu_raw_line_ref = regex_miss_raw_ref
                 if status_value == "SENT_UNKNOWN":
                     self._log(f"[DCMTK_STATUS_DETAIL_ENRICHED] file={file_path_s} reason={detail_value}")
 
@@ -946,6 +1297,8 @@ class SendWorkflow:
                         "ts_mode": ts_mode,
                         "send_status": status_value,
                         "status_detail": detail_value,
+                        "storescu_line_no": storescu_line_no_value if storescu_line_no_value > 0 else "",
+                        "storescu_raw_line": storescu_raw_line_ref,
                         "sop_instance_uid": iuid,
                         "source_ts_uid": ts_uid,
                         "source_ts_name": ts_name,
@@ -972,6 +1325,14 @@ class SendWorkflow:
                         f"chunk_no={chunk_index};file_path={file_path_s};error_type={status_value}",
                     )
 
+                if storescu_line_no_value > 0:
+                    dcmtk_last_line_no_by_file[file_path_s] = storescu_line_no_value
+                if storescu_raw_line_value:
+                    dcmtk_last_raw_line_by_file[file_path_s] = storescu_raw_line_value
+                if file_path_s in dcmtk_regex_miss_line_no_by_file:
+                    del dcmtk_regex_miss_line_no_by_file[file_path_s]
+                if file_path_s in dcmtk_regex_miss_raw_line_by_file:
+                    del dcmtk_regex_miss_raw_line_by_file[file_path_s]
                 dcmtk_written_files.add(file_path_s)
                 item_cursor += 1
                 self._log(
@@ -1040,6 +1401,7 @@ class SendWorkflow:
                             interrupted = True
                             break
                         clean = line.rstrip("\n")
+                        storescu_stream_line_no += 1
                         lines.append(clean)
                         if (not backpressure_warn_emitted) and len(lines) >= 100000:
                             backpressure_warn_emitted = True
@@ -1104,32 +1466,134 @@ class SendWorkflow:
                             m_file = DCMTK_SENDING_FILE_RE.search(clean)
                             if m_file:
                                 dcmtk_current_file = m_file.group(1).strip()
+                                if dcmtk_current_file:
+                                    dcmtk_last_line_no_by_file[dcmtk_current_file] = storescu_stream_line_no
+                                    dcmtk_last_raw_line_by_file[dcmtk_current_file] = clean
+                                _write_send_trace_row(
+                                    chunk_no=chunk_index,
+                                    event_kind="SENDING_FILE",
+                                    regex_ok=True,
+                                    storescu_line_no=storescu_stream_line_no,
+                                    mapped_file=dcmtk_current_file if dcmtk_current_file in batch_file_set else "",
+                                    probable_file=dcmtk_current_file,
+                                    mapped_confidence="CONFIRMED" if dcmtk_current_file in batch_file_set else "PROBABLE",
+                                    detail_hint="storescu_sending_file",
+                                    raw_line=clean,
+                                )
                                 self._log(
                                     f"[DCMTK_RT_PROGRESS] chunk={chunk_index}/{total_chunks} sending={dcmtk_current_file}"
                                 )
-                            m_bad = DCMTK_BAD_FILE_RE.search(clean)
-                            if m_bad:
-                                bad_file = m_bad.group(1).strip()
-                                detail = m_bad.group(2).strip()
-                                _write_dcmtk_realtime_row(
-                                    file_path_s=bad_file,
-                                    status_value="NON_DICOM",
-                                    detail_value=detail,
+                            elif clean.startswith("I: Sending file:"):
+                                fallback_file = clean.split("I: Sending file:", 1)[1].strip()
+                                mapped_from_fallback = fallback_file if fallback_file in batch_file_set else ""
+                                if mapped_from_fallback:
+                                    dcmtk_current_file = mapped_from_fallback
+                                    dcmtk_last_line_no_by_file[dcmtk_current_file] = storescu_stream_line_no
+                                    dcmtk_last_raw_line_by_file[dcmtk_current_file] = clean
+                                _emit_dcmtk_regex_miss(
+                                    "SENDING_FILE_REGEX_FAIL",
+                                    clean,
+                                    probable_file=fallback_file or "",
+                                    mapped_file=mapped_from_fallback,
                                 )
-                                if dcmtk_current_file == bad_file:
-                                    dcmtk_current_file = ""
+                            bad_file, bad_detail = parse_dcmtk_bad_dicom_line(clean)
+                            if clean.startswith("E: Bad DICOM file:") and not bad_file:
+                                _emit_dcmtk_regex_miss("BAD_DICOM_REGEX_FAIL", clean)
+                            elif bad_file:
+                                mapped_file = bad_file if bad_file in batch_file_set else ""
+                                probable_file = mapped_file or _dcmtk_guess_probable_file()
+                                detail_value = bad_detail or "Bad DICOM file"
+                                detail_value = self._compact_ref_text(f"bad_dicom|{detail_value}", max_chars=220)
+                                _write_send_trace_row(
+                                    chunk_no=chunk_index,
+                                    event_kind="BAD_DICOM",
+                                    regex_ok=True,
+                                    storescu_line_no=storescu_stream_line_no,
+                                    mapped_file=mapped_file,
+                                    probable_file=probable_file,
+                                    mapped_confidence="CONFIRMED" if mapped_file else ("PROBABLE" if probable_file else "NONE"),
+                                    status_hint="SEND_FAIL",
+                                    detail_hint=detail_value,
+                                    raw_line=clean,
+                                )
+                                raw_line_ref = self._compact_ref_text(clean.replace(";", ","), max_chars=220)
+                                write_telemetry_event(
+                                    events,
+                                    run,
+                                    "SEND_DCMTK_BAD_DICOM_LINE",
+                                    "Linha Bad DICOM detectada no output do storescu.",
+                                    (
+                                        f"chunk_no={chunk_index};storescu_line_no={storescu_stream_line_no};"
+                                        f"mapped_file={mapped_file or 'N/A'};probable_file={probable_file or 'N/A'};"
+                                        f"raw_line={raw_line_ref}"
+                                    ),
+                                )
+                                if mapped_file:
+                                    _write_dcmtk_realtime_row(
+                                        file_path_s=mapped_file,
+                                        status_value="SEND_FAIL",
+                                        detail_value=detail_value,
+                                        storescu_line_no_value=storescu_stream_line_no,
+                                        storescu_raw_line_value=clean,
+                                    )
+                                    if dcmtk_current_file == mapped_file:
+                                        dcmtk_current_file = ""
+                                else:
+                                    self._log(
+                                        f"[DCMTK_BAD_DICOM_PARSE_MISS] chunk={chunk_index}/{total_chunks} "
+                                        f"storescu_line_no={storescu_stream_line_no} probable_file={probable_file or 'N/A'}"
+                                    )
+                                    write_telemetry_event(
+                                        events,
+                                        run,
+                                        "SEND_DCMTK_BAD_DICOM_PARSE_MISS",
+                                        "Linha Bad DICOM sem mapeamento 100% confiavel.",
+                                        (
+                                            f"chunk_no={chunk_index};storescu_line_no={storescu_stream_line_no};"
+                                            f"probable_file={probable_file or 'N/A'};raw_line={raw_line_ref}"
+                                        ),
+                                    )
+                                    _emit_dcmtk_regex_miss(
+                                        "BAD_DICOM_NO_CONFIDENT_MAP",
+                                        clean,
+                                        probable_file=probable_file,
+                                    )
                             m_rsp = DCMTK_STORE_RSP_RE.search(clean)
                             if m_rsp and dcmtk_current_file:
                                 detail = m_rsp.group(1).strip()
                                 status = "SENT_OK" if "Success" in detail else "SEND_FAIL"
                                 if ("Unknown Status: 0x110" in detail) and Path(dcmtk_current_file).name.upper() == "DICOMDIR":
                                     status = "UNSUPPORTED_DICOM_OBJECT"
+                                dcmtk_last_line_no_by_file[dcmtk_current_file] = storescu_stream_line_no
+                                dcmtk_last_raw_line_by_file[dcmtk_current_file] = clean
+                                _write_send_trace_row(
+                                    chunk_no=chunk_index,
+                                    event_kind="STORE_RSP",
+                                    regex_ok=True,
+                                    storescu_line_no=storescu_stream_line_no,
+                                    mapped_file=dcmtk_current_file if dcmtk_current_file in batch_file_set else "",
+                                    probable_file=dcmtk_current_file,
+                                    mapped_confidence="CONFIRMED" if dcmtk_current_file in batch_file_set else "PROBABLE",
+                                    status_hint=status,
+                                    detail_hint=detail,
+                                    raw_line=clean,
+                                )
                                 _write_dcmtk_realtime_row(
                                     file_path_s=dcmtk_current_file,
                                     status_value=status,
                                     detail_value=detail,
+                                    storescu_line_no_value=storescu_stream_line_no,
                                 )
                                 dcmtk_current_file = ""
+                            elif m_rsp and not dcmtk_current_file:
+                                _emit_dcmtk_regex_miss("STORE_RSP_NO_CURRENT_FILE", clean)
+                            elif ("Received Store Response" in clean) and (not m_rsp):
+                                _emit_dcmtk_regex_miss(
+                                    "STORE_RSP_REGEX_FAIL",
+                                    clean,
+                                    probable_file=_dcmtk_guess_probable_file(),
+                                    mapped_file=dcmtk_current_file if dcmtk_current_file in batch_file_set else "",
+                                )
                         if show_output:
                             self._log_toolkit(clean)
                     if not interrupted:
@@ -1376,11 +1840,24 @@ class SendWorkflow:
                     ts_name = ""
                     extract_status = ""
 
-                    miuid, mts_uid, mts_name, m_err = self.driver.extract_metadata(self.cfg, file_path)
+                    metadata_exception = ""
+                    try:
+                        miuid, mts_uid, mts_name, m_err = self.driver.extract_metadata(self.cfg, file_path)
+                    except Exception as ex:
+                        miuid, mts_uid, mts_name, m_err = "", "", "", str(ex)
+                        metadata_exception = str(ex)
                     iuid = miuid
                     ts_uid = mts_uid
                     ts_name = mts_name
-                    if iuid:
+                    if metadata_exception:
+                        status = "SEND_FAIL"
+                        extract_status = "METADATA_EXCEPTION"
+                        detail = (
+                            detail
+                            + " | dcmdump_exception="
+                            + self._compact_ref_text(metadata_exception, max_chars=160)
+                        ).strip(" |")
+                    elif iuid:
                         extract_status = "OK"
                     elif status == "SENT_OK":
                         extract_status = "MISSING_IUID"
@@ -1388,6 +1865,28 @@ class SendWorkflow:
                         detail = (detail + " | " + m_err).strip(" |")
                     if status == "SENT_UNKNOWN" and not detail:
                         detail = "parse_status=UNKNOWN;reason=no_match_in_output"
+                    storescu_line_no_value = dcmtk_last_line_no_by_file.get(fp, 0)
+                    storescu_raw_line_ref = ""
+                    if fp in dcmtk_last_raw_line_by_file:
+                        storescu_raw_line_ref = self._compact_ref_text(
+                            dcmtk_last_raw_line_by_file[fp].replace(";", ","),
+                            max_chars=220,
+                        )
+                    if storescu_line_no_value > 0:
+                        detail = (detail + f" | storescu_line_no={storescu_line_no_value}").strip(" |")
+                    regex_miss_line_no = dcmtk_regex_miss_line_no_by_file.get(fp, 0)
+                    regex_miss_raw_ref = ""
+                    if fp in dcmtk_regex_miss_raw_line_by_file:
+                        regex_miss_raw_ref = self._compact_ref_text(
+                            dcmtk_regex_miss_raw_line_by_file[fp].replace(";", ","),
+                            max_chars=220,
+                        )
+                    if regex_miss_line_no > 0:
+                        detail = (detail + f" | storescu_regex_miss_line_no={regex_miss_line_no}").strip(" |")
+                    if regex_miss_raw_ref:
+                        detail = (detail + f" | storescu_regex_miss_raw_line={regex_miss_raw_ref}").strip(" |")
+                        if not storescu_raw_line_ref:
+                            storescu_raw_line_ref = regex_miss_raw_ref
                     if status == "SENT_UNKNOWN" and detail:
                         self._log(f"[DCMTK_STATUS_DETAIL_ENRICHED] file={fp} reason={detail}")
 
@@ -1409,6 +1908,8 @@ class SendWorkflow:
                             "ts_mode": ts_mode,
                             "send_status": status,
                             "status_detail": detail,
+                            "storescu_line_no": storescu_line_no_value if storescu_line_no_value > 0 else "",
+                            "storescu_raw_line": storescu_raw_line_ref,
                             "sop_instance_uid": iuid,
                             "source_ts_uid": ts_uid,
                             "source_ts_name": ts_name,
@@ -1425,6 +1926,10 @@ class SendWorkflow:
                             detail or status,
                             f"chunk_no={chunk_index};file_path={fp};error_type={status}",
                         )
+                    if fp in dcmtk_regex_miss_line_no_by_file:
+                        del dcmtk_regex_miss_line_no_by_file[fp]
+                    if fp in dcmtk_regex_miss_raw_line_by_file:
+                        del dcmtk_regex_miss_raw_line_by_file[fp]
                     parse_notes = parse_exception_by_file.get(fp, [])
                     if parse_notes:
                         warn_type_counts["PARSE_EXCEPTION"] = warn_type_counts.get("PARSE_EXCEPTION", 0) + 1
