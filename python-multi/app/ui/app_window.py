@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from app.config.settings import AppConfig
 from app.domain.constants import APP_DISPLAY_NAME
-from app.infra.run_artifacts import read_csv_rows, resolve_run_artifact_path
+from app.infra.run_artifacts import read_csv_rows, resolve_run_artifact_path, run_artifact_variants
 from app.integrations.toolkit_drivers import apply_internal_toolkit_paths, find_toolkit_bin, get_driver
 from app.shared.utils import (
     format_duration_sec,
@@ -84,6 +84,7 @@ class App(tk.Tk):
         self.var_log_filter_send = tk.StringVar(value="Todos")
         self.var_log_filter_val = tk.StringVar(value="Todos")
         self._max_log_buffer_lines = 6000
+        self._max_toolkit_log_buffer_lines = 800
         self._log_refresh_batch_size = 300
         self._log_filter_debounce_ms = 180
         self._log_buffers: dict[str, list[tuple[str, str, str]]] = {"an": [], "send": [], "val": []}
@@ -417,13 +418,27 @@ class App(tk.Tk):
             return (self.base_dir / p).resolve()
         return (self.base_dir / "runs").resolve()
 
+    def _run_has_analysis(self, run_id: str) -> bool:
+        rid = (run_id or "").strip()
+        if not rid:
+            return False
+        run_dir = self._runs_base() / rid
+        if not run_dir.exists():
+            return False
+        for filename in ("manifest_files.csv", "analysis_summary.csv"):
+            cat_path, leg_path = run_artifact_variants(run_dir, filename)
+            if cat_path.exists() or leg_path.exists():
+                return True
+        return False
+
     def _refresh_run_list(self):
         runs_base = self._runs_base()
         runs_base.mkdir(parents=True, exist_ok=True)
         runs = [p.name for p in runs_base.iterdir() if p.is_dir()]
         runs.sort(reverse=True)
         self.cmb_an_runs["values"] = runs
-        self.cmb_send_runs["values"] = runs
+        runs_with_analysis = [r for r in runs if self._run_has_analysis(r)]
+        self.cmb_send_runs["values"] = runs_with_analysis
         self.cmb_val_runs["values"] = runs
         self.lst_runs.delete(0, tk.END)
         for r in runs:
@@ -771,6 +786,13 @@ class App(tk.Tk):
         run_id = self.var_send_run.get().strip()
         if not run_id:
             messagebox.showerror("Erro", "Informe o run_id.")
+            return
+        if not self._run_has_analysis(run_id):
+            messagebox.showwarning(
+                "Run sem analise",
+                f"O run '{run_id}' ainda nao foi analisado.\n\nExecute a analise na aba Analise antes de iniciar o envio.",
+                parent=self,
+            )
             return
         try:
             batch = int(self.var_batch_size.get().strip())
@@ -1231,6 +1253,22 @@ class App(tk.Tk):
         tag = self._classify_log_tag(text)
         buf = self._log_buffers.setdefault(panel, [])
         buf.append((text, tag, source))
+        if panel == "send" and source == "toolkit":
+            toolkit_count = sum(1 for _, _, s in buf if s == "toolkit")
+            if toolkit_count > self._max_toolkit_log_buffer_lines:
+                to_remove = toolkit_count - self._max_toolkit_log_buffer_lines
+                removed = 0
+                i = 0
+                while removed < to_remove and i < len(buf):
+                    if buf[i][2] == "toolkit":
+                        del buf[i]
+                        removed += 1
+                    else:
+                        i += 1
+                if removed > 0:
+                    print(
+                        f"[LOG_TOOLKIT_TRIM] panel=send removed={removed} toolkit_lines_kept={self._max_toolkit_log_buffer_lines}"
+                    )
         if len(buf) > self._max_log_buffer_lines:
             removed = len(buf) - self._max_log_buffer_lines
             del buf[:removed]
