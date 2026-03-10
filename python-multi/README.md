@@ -51,7 +51,7 @@ Cada `run_id` agora organiza os artefatos em subpastas:
   - `manifest_files.csv`
   - `analysis_summary.csv`
   - `send_results_by_file.csv`
-  - `send_results_by_file_trace.csv` (sidecar de rastreabilidade de linhas do storescu)
+  - `send_results_by_file_trace.csv` (sidecar somente quando retomando run legado com schema antigo de `send_results_by_file.csv`)
   - `send_summary.csv`
   - `validation_results.csv`
   - `send_checkpoint_dcm4che_folders.json` ou `send_checkpoint_dcm4che_files.json` (quando toolkit = dcm4che)
@@ -171,7 +171,9 @@ No menu `Configuracao -> Configuracoes`:
   - no modo `dcm4che + FOLDERS`, o cursor de retomada continua por unidade de pasta (limitacao natural do envio por pasta)
   - em retomadas, a numeracao de chunk continua a partir do maior `chunk_no` ja registrado no `send_results_by_file.csv` (evita sobrescrever `batch_*.txt/javaargs` e traces de comando)
   - no `dcmtk`, o progresso de itens e a escrita de `send_results_by_file.csv` tambem ocorrem em tempo real durante o chunk (coerente com checkpoint por item)
-  - compatibilidade de schema: `send_results_by_file.csv` permanece canônico para retomada; detalhes de rastreabilidade de linha do `storescu` ficam no sidecar `send_results_by_file_trace.csv`
+  - compatibilidade de schema: `send_results_by_file.csv` permanece canônico para retomada
+  - sidecar `send_results_by_file_trace.csv` e ativado apenas quando o app detecta run legado (header antigo sem `storescu_line_no/storescu_raw_line`)
+  - em runs novos (schema moderno), a rastreabilidade fica unificada no canônico (sem sidecar)
 - Regras de indexacao por extensao
   - lista separada por virgula, ex.: `.dcm,.ima,.dicom`
   - opcao `Nao restringir por extensao (incluir todos os arquivos)` (desmarcada por padrao)
@@ -198,8 +200,14 @@ No menu principal ha um item `Sobre` que mostra a versao atual da aplicacao.
 Na aba `Send`, a visualizacao de log e separada em dois canais:
 - `Exibir mensagens internas do sistema`
 - `Exibir output bruto da toolkit (tempo real)`
+- por padrao, o output bruto inicia desmarcado; a UI exibe aviso de que habilitar esse modo pode pesar CPU/RAM em maquinas modestas.
 
 E possivel combinar esses controles com o filtro de tela (`Todos`, `Sistema`, `Warnings + Erros`) sem alterar os arquivos de log em disco.
+
+Arquitetura de logs da UI (dual-channel, otimizada para baixa memoria):
+- `Sistema` e `Warnings + Erros`: atualizados por stream leve (eventos internos + linhas criticas da toolkit).
+- `Bruto`: renderizado por tail incremental do `storescu_execucao.log` apenas quando `Exibir output bruto da toolkit` estiver ON e filtro em `Todos`.
+- ao marcar/desmarcar o output bruto durante o send, o tail e ativado/desativado automaticamente (liberando processamento quando OFF).
 
 Detalhes de performance do filtro de log:
 - o refresh usa debounce por painel com token de geracao (descarta resultados obsoletos em alternancias rapidas);
@@ -214,8 +222,12 @@ Diagnostico `dcmtk` para linhas `Bad DICOM file`:
 - quando o parser mapeia o arquivo com confianca, o item e registrado em `send_results_by_file.csv` como `SEND_FAIL` (ex.: `bad_dicom|...`);
 - quando nao ha mapeamento 100% confiavel, o app registra em `events.csv` a `raw_line`, `storescu_line_no` e `probable_file` (seguindo sequencia do log) para rastreabilidade.
 - para eventos monitorados do `storescu` (`Sending file`, `Bad DICOM file`, `Store Response`), falhas de regex tambem geram evento em `events.csv` com `raw_line`, `storescu_line_no`, `mapped_file` (quando houver) e `probable_file`.
-- no `send_results_by_file_trace.csv` (sidecar), os eventos monitorados do `storescu` sao persistidos com `storescu_line_no`, `raw_line`, `mapped_file` e `probable_file` para diagnostico completo sem quebrar runs legados.
+- no `send_results_by_file_trace.csv` (sidecar), os eventos monitorados do `storescu` sao persistidos apenas em retomada de run legado com schema antigo, para diagnostico completo sem quebrar compatibilidade.
 - no `send_results_by_file.csv`, linhas com mapeamento de arquivo persistem `storescu_line_no` sempre que disponivel; em casos de regex miss com mapeamento confiavel, a linha crua e registrada no detalhe (`storescu_regex_miss_raw_line=...`), preservando compatibilidade com schema antigo.
+
+Observacao de evolucao futura (enxugamento):
+- o suporte legado de sidecar foi encapsulado na funcao de decisao de modo de trace do workflow de envio (`_resolve_send_trace_mode`, com modos `CANONICAL_ONLY` vs `LEGACY_SIDECAR`);
+- com o encerramento definitivo de runs legadas, o caminho recomendado e fixar `CANONICAL_ONLY` e remover o sidecar sem alterar o fluxo principal de envio.
 
 Na aba `Send`, o botao `Novo run` limpa o `run_id` selecionado e leva para a aba `Analise` com o campo `Run ID (opcional)` em branco (fluxo guiado para iniciar novo run).
 

@@ -75,6 +75,17 @@ class App(tk.Tk):
         self.queue: queue.Queue = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.cancel_event = threading.Event()
+        self._active_send_workflow: SendWorkflow | None = None
+        self._close_after_cancel_requested = False
+        self._close_after_cancel_started_at = 0.0
+        self._close_after_cancel_timeout_sec = 6.0
+        self._send_tail_after_id: str | None = None
+        self._send_tail_run_id = ""
+        self._send_tail_log_path: Path | None = None
+        self._send_tail_offset = 0
+        self._send_tail_interval_ms = 250
+        self._send_tail_backfill_lines = 150
+        self._send_tail_max_lines_per_cycle = 300
 
         self.progress_items_var = tk.StringVar(value="enviando item 0 de 0")
         self.progress_chunks_var = tk.StringVar(value="batch chunk 0 de 0 | retomada: nao")
@@ -88,6 +99,7 @@ class App(tk.Tk):
         self._log_refresh_batch_size = 300
         self._log_filter_debounce_ms = 180
         self._log_buffers: dict[str, list[tuple[str, str, str]]] = {"an": [], "send": [], "val": []}
+        self._log_toolkit_counts: dict[str, int] = {"an": 0, "send": 0, "val": 0}
         self._log_buffer_versions: dict[str, int] = {"an": 0, "send": 0, "val": 0}
         self._log_widgets: dict[str, tk.Text] = {}
         self._log_refresh_tokens: dict[str, int] = {"an": 0, "send": 0, "val": 0}
@@ -109,6 +121,7 @@ class App(tk.Tk):
         self._setup_ui_styles()
         self._build_ui()
         self._poll_queue()
+        self.protocol("WM_DELETE_WINDOW", self._on_close_requested)
 
     def _load_config(self) -> AppConfig:
         dcm4che_bin = find_toolkit_bin(self.base_dir, "dcm4che", "storescu.bat")
@@ -279,7 +292,7 @@ class App(tk.Tk):
         top.pack(fill="x")
         self.var_send_run = tk.StringVar()
         self.var_show_send_internal = tk.BooleanVar(value=True)
-        self.var_show_output = tk.BooleanVar(value=True)
+        self.var_show_output = tk.BooleanVar(value=False)
         ttk.Label(top, text="Run ID analisado").grid(row=0, column=0, sticky="w")
         self.cmb_send_runs = ttk.Combobox(top, textvariable=self.var_send_run, width=36)
         self.cmb_send_runs.grid(row=0, column=1, sticky="w", padx=6)
@@ -297,6 +310,11 @@ class App(tk.Tk):
             variable=self.var_show_output,
             command=lambda: self._on_log_filter_changed("send"),
         ).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(
+            top,
+            text="Aviso: habilitar output bruto pode pesar o sistema (CPU/RAM).",
+            foreground="#8a4b00",
+        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=4)
         btns = ttk.Frame(top)
         btns.grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
         ttk.Button(btns, text="Iniciar Send", command=self._start_send).pack(side="left", padx=4)
@@ -879,6 +897,7 @@ class App(tk.Tk):
 
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
+        self._reconcile_send_tail_state()
 
     def _start_send(self):
         if self._worker_busy():
@@ -985,6 +1004,7 @@ class App(tk.Tk):
             )
 
         def task():
+            wf: SendWorkflow | None = None
             try:
                 wf = SendWorkflow(
                     self.config_obj,
@@ -993,10 +1013,14 @@ class App(tk.Tk):
                     progress,
                     toolkit_logger=lambda m: self.queue.put(("send_log_toolkit", m)),
                 )
+                self._active_send_workflow = wf
                 result = wf.run_send(run_id=run_id, batch_size=batch, show_output=show_output)
                 self.queue.put(("send_done", result))
             except Exception as ex:
                 self.queue.put(("send_error", str(ex)))
+            finally:
+                if self._active_send_workflow is wf:
+                    self._active_send_workflow = None
 
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
@@ -1063,13 +1087,68 @@ class App(tk.Tk):
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
 
+    def _request_send_force_stop(self, reason: str) -> None:
+        wf = self._active_send_workflow
+        if wf is None:
+            return
+        try:
+            wf.request_force_stop(reason=reason)
+        except Exception as ex:
+            self._log_send(f"[WARN] Falha ao forcar parada do processo de envio: {ex}")
+
     def _cancel_current_job(self):
         if not self._worker_busy():
             return
         self.cancel_event.set()
+        self._request_send_force_stop(reason="ui_cancel")
         self._log_an("Cancelamento solicitado...")
         self._log_send("[SEND_CANCEL_REQUEST] Cancelamento solicitado...")
         self._log_val("Cancelamento solicitado...")
+
+    def _on_close_requested(self):
+        if self._close_after_cancel_requested:
+            return
+        if not self._worker_busy():
+            self.destroy()
+            return
+        confirm = messagebox.askyesno(
+            "Fechar aplicativo",
+            (
+                "Ha uma operacao em andamento (analise/send/validacao/exportacao).\n\n"
+                "Deseja cancelar a operacao atual e fechar o aplicativo?"
+            ),
+            parent=self,
+        )
+        if not confirm:
+            return
+        self._close_after_cancel_requested = True
+        self._close_after_cancel_started_at = time.monotonic()
+        self._cancel_current_job()
+        self._request_send_force_stop(reason="window_close")
+        self.after(120, self._poll_close_after_cancel)
+
+    def _poll_close_after_cancel(self):
+        if not self._close_after_cancel_requested:
+            return
+        if not self._worker_busy():
+            self._close_after_cancel_requested = False
+            self.destroy()
+            return
+        elapsed = time.monotonic() - self._close_after_cancel_started_at
+        if elapsed >= self._close_after_cancel_timeout_sec:
+            self._close_after_cancel_requested = False
+            force_close = messagebox.askyesno(
+                "Encerramento pendente",
+                (
+                    "A operacao ainda esta finalizando.\n\n"
+                    "Deseja forcar o fechamento agora?"
+                ),
+                parent=self,
+            )
+            if force_close:
+                self.destroy()
+            return
+        self.after(120, self._poll_close_after_cancel)
 
     def _setup_log_tags(self, widget: tk.Text) -> None:
         # Visual-only highlighting in UI. Raw log files remain plain text.
@@ -1153,6 +1232,136 @@ class App(tk.Tk):
             return self.var_log_filter_val.get().strip() or "Todos"
         return "Todos"
 
+    def _is_send_toolkit_raw_source(self, source: str) -> bool:
+        return source in {"toolkit", "toolkit_tail"}
+
+    def _send_tail_mode_enabled(self) -> bool:
+        if (self._active_send_workflow is None) or (not self._worker_busy()):
+            return False
+        if self._log_filter_mode("send") != "Todos":
+            return False
+        return bool(self.var_show_output.get())
+
+    def _current_send_tail_target(self) -> tuple[str, Path | None]:
+        run_id = self.var_send_run.get().strip()
+        if not run_id:
+            return "", None
+        run_dir = self._runs_base() / run_id
+        if not run_dir.exists():
+            return run_id, None
+        log_path = resolve_run_artifact_path(run_dir, "storescu_execucao.log", for_write=False)
+        return run_id, log_path
+
+    def _read_last_lines_from_file(self, file_path: Path, max_lines: int, max_bytes: int = 262144) -> list[str]:
+        if max_lines <= 0 or (not file_path.exists()):
+            return []
+        try:
+            size = file_path.stat().st_size
+            with file_path.open("rb") as f:
+                if size > max_bytes:
+                    f.seek(size - max_bytes)
+                data = f.read()
+        except Exception:
+            return []
+        text = data.decode("utf-8", errors="replace")
+        return text.splitlines()[-max_lines:]
+
+    def _append_send_tail_line(self, text: str) -> None:
+        tag = self._classify_log_tag(text)
+        # Stream channel is authoritative for system and warning/error lines.
+        if tag in {"log_system", "log_warn", "log_error"}:
+            return
+        self._append_log_line("send", text, source="toolkit_tail")
+
+    def _bootstrap_send_tail(self, log_path: Path) -> None:
+        if not log_path.exists():
+            self._send_tail_offset = 0
+            return
+        backfill = self._read_last_lines_from_file(log_path, self._send_tail_backfill_lines)
+        for ln in backfill:
+            self._append_send_tail_line(ln)
+        try:
+            self._send_tail_offset = log_path.stat().st_size
+        except Exception:
+            self._send_tail_offset = 0
+        self._emit_log_refresh_marker(
+            "send",
+            f"[UI_TAIL_BOOTSTRAP] run_id={self._send_tail_run_id} lines={len(backfill)} offset={self._send_tail_offset}",
+        )
+
+    def _stop_send_tail(self) -> None:
+        if self._send_tail_after_id:
+            try:
+                self.after_cancel(self._send_tail_after_id)
+            except Exception:
+                pass
+            self._send_tail_after_id = None
+
+    def _start_send_tail_if_needed(self) -> None:
+        run_id, log_path = self._current_send_tail_target()
+        if not run_id or log_path is None:
+            self._stop_send_tail()
+            return
+        if (self._send_tail_run_id != run_id) or (self._send_tail_log_path != log_path):
+            self._send_tail_run_id = run_id
+            self._send_tail_log_path = log_path
+            self._send_tail_offset = 0
+            self._bootstrap_send_tail(log_path)
+            self._emit_log_refresh_marker("send", f"[UI_TAIL_START] run_id={run_id} file={log_path}")
+        if not self._send_tail_after_id:
+            self._send_tail_after_id = self.after(0, self._poll_send_tail)
+
+    def _reconcile_send_tail_state(self) -> None:
+        if self._send_tail_mode_enabled():
+            self._start_send_tail_if_needed()
+            return
+        self._stop_send_tail()
+
+    def _poll_send_tail(self) -> None:
+        self._send_tail_after_id = None
+        if not self._send_tail_mode_enabled():
+            return
+        if self._send_tail_log_path is None:
+            self._start_send_tail_if_needed()
+            return
+        log_path = self._send_tail_log_path
+        if not log_path.exists():
+            self._send_tail_after_id = self.after(self._send_tail_interval_ms, self._poll_send_tail)
+            return
+        try:
+            file_size = log_path.stat().st_size
+        except Exception:
+            self._send_tail_after_id = self.after(self._send_tail_interval_ms, self._poll_send_tail)
+            return
+        if file_size < self._send_tail_offset:
+            self._send_tail_offset = 0
+            self._emit_log_refresh_marker("send", f"[UI_TAIL_ROTATE_SWITCH] run_id={self._send_tail_run_id} file={log_path}")
+
+        processed = 0
+        try:
+            with log_path.open("rb") as f:
+                f.seek(self._send_tail_offset)
+                while processed < self._send_tail_max_lines_per_cycle:
+                    bline = f.readline()
+                    if not bline:
+                        break
+                    self._send_tail_offset = f.tell()
+                    clean = bline.decode("utf-8", errors="replace").rstrip("\r\n")
+                    self._append_send_tail_line(clean)
+                    processed += 1
+        except Exception as ex:
+            self._emit_log_refresh_marker("send", f"[UI_TAIL_READ_WARN] run_id={self._send_tail_run_id} error={ex}")
+
+        if processed >= self._send_tail_max_lines_per_cycle:
+            self._emit_log_refresh_marker(
+                "send",
+                f"[UI_TAIL_BACKPRESSURE] run_id={self._send_tail_run_id} max_cycle={self._send_tail_max_lines_per_cycle}",
+            )
+            next_delay = 25
+        else:
+            next_delay = self._send_tail_interval_ms
+        self._send_tail_after_id = self.after(next_delay, self._poll_send_tail)
+
     def _line_matches_filter_values(
         self,
         panel: str,
@@ -1165,10 +1374,10 @@ class App(tk.Tk):
         if panel == "send":
             if source == "internal" and not show_send_internal:
                 return False
-            if source == "toolkit" and not show_send_toolkit:
-                # Keep critical diagnostics visible even with toolkit stream toggle OFF.
-                if not (mode == "Warnings + Erros" and tag in ["log_warn", "log_error"]):
-                    return False
+            if self._is_send_toolkit_raw_source(source) and not show_send_toolkit:
+                return False
+            if mode in {"Sistema", "Warnings + Erros"} and self._is_send_toolkit_raw_source(source):
+                return False
         if mode == "Todos":
             return True
         if mode == "Sistema":
@@ -1224,6 +1433,8 @@ class App(tk.Tk):
         mode = self._log_filter_mode(panel)
         self._emit_log_refresh_marker(panel, f"[LOG_FILTER_CHANGE] panel={panel} mode={mode}")
         self._schedule_log_refresh(panel, debounce_ms=self._log_filter_debounce_ms)
+        if panel == "send":
+            self._reconcile_send_tail_state()
 
     def _schedule_log_refresh(self, panel: str, debounce_ms: int) -> None:
         prev_after = self._log_refresh_after_ids.get(panel)
@@ -1388,16 +1599,19 @@ class App(tk.Tk):
         tag = self._classify_log_tag(text)
         buf = self._log_buffers.setdefault(panel, [])
         buf.append((text, tag, source))
-        if panel == "send" and source == "toolkit":
-            toolkit_count = sum(1 for _, _, s in buf if s == "toolkit")
+        if panel == "send" and self._is_send_toolkit_raw_source(source):
+            self._log_toolkit_counts[panel] = self._log_toolkit_counts.get(panel, 0) + 1
+        if panel == "send" and self._is_send_toolkit_raw_source(source):
+            toolkit_count = self._log_toolkit_counts.get(panel, 0)
             if toolkit_count > self._max_toolkit_log_buffer_lines:
                 to_remove = toolkit_count - self._max_toolkit_log_buffer_lines
                 removed = 0
                 i = 0
                 while removed < to_remove and i < len(buf):
-                    if buf[i][2] == "toolkit":
+                    if self._is_send_toolkit_raw_source(buf[i][2]):
                         del buf[i]
                         removed += 1
+                        self._log_toolkit_counts[panel] = max(0, self._log_toolkit_counts.get(panel, 0) - 1)
                     else:
                         i += 1
                 if removed > 0:
@@ -1406,6 +1620,13 @@ class App(tk.Tk):
                     )
         if len(buf) > self._max_log_buffer_lines:
             removed = len(buf) - self._max_log_buffer_lines
+            if removed > 0 and panel == "send":
+                toolkit_removed = sum(1 for _text, _tag, src in buf[:removed] if self._is_send_toolkit_raw_source(src))
+                if toolkit_removed:
+                    self._log_toolkit_counts[panel] = max(
+                        0,
+                        self._log_toolkit_counts.get(panel, 0) - toolkit_removed,
+                    )
             del buf[:removed]
             print(f"[LOG_BUFFER_TRIM] panel={panel} removed={removed} max={self._max_log_buffer_lines}")
         self._log_buffer_versions[panel] = self._log_buffer_versions.get(panel, 0) + 1
@@ -1453,7 +1674,7 @@ class App(tk.Tk):
                 elif event == "send_log_internal":
                     self._log_send(payload, source="internal")
                 elif event == "send_log_toolkit":
-                    self._log_send(payload, source="toolkit")
+                    self._log_send(payload, source="toolkit_stream")
                 elif event == "val_log":
                     self._log_val(payload)
                 elif event == "log_refresh_ready":
@@ -1561,4 +1782,5 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self._sync_activity_indicator()
+        self._reconcile_send_tail_state()
         self.after(120, self._poll_queue)

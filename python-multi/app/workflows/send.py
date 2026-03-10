@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.config.settings import AppConfig
 from app.domain.constants import (
+    CSV_SEP,
     DCM4CHE_CRITICAL_JAR_MARKERS,
     DCM4CHE_JAVA_MAIN_CLASS,
     DCM4CHE_STORE_RQ_RE,
@@ -64,6 +65,55 @@ class SendWorkflow:
 
     def _log_toolkit(self, msg: str) -> None:
         self.toolkit_logger(msg)
+
+    def request_force_stop(self, reason: str = "external_request") -> None:
+        self.cancel_event.set()
+        self._log(f"[SEND_FORCE_STOP_REQUEST] reason={reason}")
+        self._kill_current_process_tree()
+
+    def _is_ui_relevant_toolkit_line(self, text: str) -> bool:
+        up = (text or "").strip().upper()
+        if not up:
+            return False
+        if up.startswith(("E:", "F:", "W:", "SEVERE:", "WARNING:")):
+            return True
+        return any(
+            marker in up
+            for marker in [
+                "BAD DICOM FILE",
+                "FAILED TO ADD DATA SET FROM FILE",
+                "FAILED TO SEND DATA SET",
+                "NO PRESENTATION CONTEXT",
+                "STORE RESPONSE (STATUS: A7",
+                "STORE RESPONSE (STATUS: A9",
+                "STORE RESPONSE (STATUS: C",
+                "DICOMSTREAMEXCEPTION",
+                "EOFEXCEPTION",
+            ]
+        )
+
+    def _read_csv_header_fields(self, csv_path: Path) -> set[str]:
+        if not csv_path.exists():
+            return set()
+        try:
+            with csv_path.open("r", encoding="utf-8", errors="replace") as f:
+                first = (f.readline() or "").strip()
+        except Exception:
+            return set()
+        if not first:
+            return set()
+        return {x.strip() for x in first.split(CSV_SEP) if x.strip()}
+
+    def _resolve_send_trace_mode(self, send_results_read: Path, is_resuming: bool) -> str:
+        if not is_resuming:
+            return "CANONICAL_ONLY"
+        header_fields = self._read_csv_header_fields(send_results_read)
+        if not header_fields:
+            return "CANONICAL_ONLY"
+        required_modern_fields = {"storescu_line_no", "storescu_raw_line"}
+        if required_modern_fields.issubset(header_fields):
+            return "CANONICAL_ONLY"
+        return "LEGACY_SIDECAR"
 
     def _resolve_runs_base(self, script_dir: Path) -> Path:
         if self.cfg.runs_base_dir.strip():
@@ -302,6 +352,10 @@ class SendWorkflow:
             f"dcm4che_exec_reason={dcm4che_exec_reason if self.cfg.toolkit == 'dcm4che' else 'N/A'} "
             f"send_precheck_before_send={'ON' if bool(getattr(self.cfg, 'send_precheck_before_send', False)) else 'OFF'}"
         )
+        self._log(
+            f"[SEND_UI_STREAM_MODE] toolkit_output=CRITICAL_ONLY "
+            f"ui_raw_checkbox={'ON' if show_output else 'OFF'}"
+        )
         self._log("[RUN_LAYOUT] mode=send layout=core|telemetry|reports")
 
         manifest_files = resolve_run_artifact_path(run_dir, "manifest_files.csv", for_write=False, logger=self._log)
@@ -408,11 +462,15 @@ class SendWorkflow:
         log_file = resolve_run_artifact_path(run_dir, "storescu_execucao.log", for_write=True, logger=self._log)
         events = resolve_run_artifact_path(run_dir, "events.csv", for_write=True, logger=self._log)
         send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
-        send_results_trace = resolve_run_artifact_path(run_dir, "send_results_by_file_trace.csv", for_write=True, logger=self._log)
+        trace_mode = self._resolve_send_trace_mode(send_results_read, is_resuming)
+        use_legacy_sidecar = trace_mode == "LEGACY_SIDECAR"
+        send_results_trace: Path | None = None
+        if use_legacy_sidecar:
+            send_results_trace = resolve_run_artifact_path(run_dir, "send_results_by_file_trace.csv", for_write=True, logger=self._log)
         send_summary = resolve_run_artifact_path(run_dir, "send_summary.csv", for_write=True, logger=self._log)
         checkpoint = resolve_run_artifact_path(run_dir, checkpoint_name, for_write=True, logger=self._log)
         args_dir = resolve_run_batch_args_dir(run_dir, for_write=True, logger=self._log)
-        compat_sidecar_bootstrap = is_resuming and send_results_read.exists() and (not send_results_trace.exists())
+        compat_sidecar_bootstrap = bool(use_legacy_sidecar and send_results_trace is not None and (not send_results_trace.exists()))
         chunk_cmd_dir = run_dir / RUN_SUBDIR_TELEMETRY / "chunk_commands"
         if not is_resuming and chunk_cmd_dir.exists():
             for fp in chunk_cmd_dir.glob("*"):
@@ -463,6 +521,21 @@ class SendWorkflow:
                 f"mode=DCMTK_FATAL_ONLY;"
                 f"toolkit={self.cfg.toolkit};"
                 f"dcmdump={dcmtk_precheck_dcmdump or 'N/A'}"
+            ),
+        )
+        self._log(
+            f"[TRACE_COMPAT_MODE] mode={trace_mode} legacy_sidecar={'ON' if use_legacy_sidecar else 'OFF'} "
+            f"is_resuming={'1' if is_resuming else '0'} send_results={send_results_read}"
+        )
+        write_telemetry_event(
+            events,
+            run,
+            "RUN_SEND_TRACE_MODE",
+            "Modo de rastreabilidade de linhas do storescu definido.",
+            (
+                f"mode={trace_mode};legacy_sidecar={'ON' if use_legacy_sidecar else 'OFF'};"
+                f"is_resuming={'1' if is_resuming else '0'};"
+                f"canonical={send_results};sidecar={send_results_trace or 'N/A'}"
             ),
         )
         if compat_sidecar_bootstrap:
@@ -673,6 +746,8 @@ class SendWorkflow:
             detail_hint: str = "",
             raw_line: str = "",
         ) -> None:
+            if (not use_legacy_sidecar) or send_results_trace is None:
+                return
             write_csv_row(
                 send_results_trace,
                 {
@@ -1594,7 +1669,7 @@ class SendWorkflow:
                                     probable_file=_dcmtk_guess_probable_file(),
                                     mapped_file=dcmtk_current_file if dcmtk_current_file in batch_file_set else "",
                                 )
-                        if show_output:
+                        if self._is_ui_relevant_toolkit_line(clean):
                             self._log_toolkit(clean)
                     if not interrupted:
                         self.current_proc.wait()
