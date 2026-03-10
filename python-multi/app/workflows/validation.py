@@ -13,6 +13,7 @@ from app.infra.run_artifacts import (
     merge_iuid_map_from_legacy_file,
     read_csv_rows,
     resolve_run_artifact_path,
+    set_internal_text_rotate_max_mb,
     write_csv_row,
     write_csv_table,
     write_telemetry_event,
@@ -31,6 +32,17 @@ class ValidationWorkflow:
 
     def _log(self, msg: str) -> None:
         self.logger(msg)
+
+    def _apply_internal_rotate_config(self, scope: str) -> None:
+        try:
+            internal_text_rotate_max_mb = max(1, int(getattr(self.cfg, "internal_text_rotate_max_mb", 250)))
+        except Exception:
+            internal_text_rotate_max_mb = 250
+        internal_text_rotate_max_bytes = set_internal_text_rotate_max_mb(internal_text_rotate_max_mb)
+        self._log(
+            f"[INTERNAL_ROTATE_CONFIG] scope={scope} max_mb={internal_text_rotate_max_mb} "
+            f"max_bytes={internal_text_rotate_max_bytes}"
+        )
 
     def _resolve_runs_base(self, script_dir: Path) -> Path:
         if self.cfg.runs_base_dir.strip():
@@ -110,6 +122,7 @@ class ValidationWorkflow:
         if not run_dir.exists():
             raise RuntimeError(f"Run nao encontrado: {run_dir}")
         self._log("[RUN_LAYOUT] mode=report_export layout=core|telemetry|reports")
+        self._apply_internal_rotate_config(scope="report_export")
 
         send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
         legacy_file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=False, logger=self._log)
@@ -299,6 +312,7 @@ class ValidationWorkflow:
         if not run_dir.exists():
             raise RuntimeError(f"Run nao encontrado: {run_dir}")
         self._log("[RUN_LAYOUT] mode=validation layout=core|telemetry|reports")
+        self._apply_internal_rotate_config(scope="validation")
 
         send_results = resolve_run_artifact_path(run_dir, "send_results_by_file.csv", for_write=True, logger=self._log)
         legacy_file_iuid_map = resolve_run_artifact_path(run_dir, "file_iuid_map.csv", for_write=False, logger=self._log)

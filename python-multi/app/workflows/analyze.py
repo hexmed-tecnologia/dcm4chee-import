@@ -9,7 +9,9 @@ from app.config.settings import AppConfig
 from app.domain.constants import CSV_SEP
 from app.infra.run_artifacts import (
     cleanup_run_artifact_variants,
+    next_incremental_rotated_path,
     resolve_run_artifact_path,
+    set_internal_text_rotate_max_mb,
     write_csv_row,
     write_telemetry_event,
 )
@@ -79,6 +81,15 @@ class AnalyzeWorkflow:
         run_dir = runs_base / run
         run_dir.mkdir(parents=True, exist_ok=True)
         self._log("[RUN_LAYOUT] mode=analysis layout=core|telemetry|reports")
+        try:
+            internal_text_rotate_max_mb = max(1, int(getattr(self.cfg, "internal_text_rotate_max_mb", 250)))
+        except Exception:
+            internal_text_rotate_max_mb = 250
+        internal_text_rotate_max_bytes = set_internal_text_rotate_max_mb(internal_text_rotate_max_mb)
+        self._log(
+            f"[INTERNAL_ROTATE_CONFIG] scope=analysis max_mb={internal_text_rotate_max_mb} "
+            f"max_bytes={internal_text_rotate_max_bytes}"
+        )
 
         root = Path(exam_root).resolve()
         if not root.exists():
@@ -211,11 +222,33 @@ class AnalyzeWorkflow:
             manifest_writer.writeheader()
 
             def flush_manifest_buffer() -> None:
+                nonlocal f_manifest, manifest_writer
                 if not row_buffer:
                     return
                 manifest_writer.writerows(row_buffer)
                 row_buffer.clear()
                 f_manifest.flush()
+                try:
+                    current_size = manifest_files.stat().st_size if manifest_files.exists() else 0
+                except Exception:
+                    current_size = 0
+                if current_size >= internal_text_rotate_max_bytes:
+                    f_manifest.close()
+                    rotated_manifest = next_incremental_rotated_path(manifest_files)
+                    rotate_ok = False
+                    try:
+                        manifest_files.rename(rotated_manifest)
+                        rotate_ok = True
+                        self._log(
+                            f"[ARTIFACT_ROTATE] file={manifest_files} rotated_to={rotated_manifest} "
+                            f"max_bytes={internal_text_rotate_max_bytes}"
+                        )
+                    except Exception as ex:
+                        self._log(f"[ARTIFACT_ROTATE_WARN] file={manifest_files} error={ex}")
+                    f_manifest = manifest_files.open("w" if rotate_ok else "a", newline="", encoding="utf-8")
+                    manifest_writer = csv.DictWriter(f_manifest, fieldnames=file_output_fields, delimiter=CSV_SEP)
+                    if rotate_ok:
+                        manifest_writer.writeheader()
 
             while dir_stack:
                 if self.cancel_event.is_set():

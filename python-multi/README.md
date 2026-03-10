@@ -60,7 +60,7 @@ Cada `run_id` agora organiza os artefatos em subpastas:
 - `telemetry/`
   - `events.csv` (telemetria consolidada do run)
   - `storescu_execucao.log` (log ativo do storescu; quando atinge o limite de tamanho e rotacionado)
-  - arquivos rotacionados: `storescu_execucao.YYYYMMDD_HHMMSS.NNNNNN.log` (ex.: `storescu_execucao.20260307_091746.000001.log`)
+  - arquivos rotacionados: `storescu_execucao_2.log`, `storescu_execucao_3.log`, ...
   - `chunk_commands/` (dump do comando efetivo por chunk, incluindo modo de execucao)
 - `reports/`
   - `reconciliation_report.csv`
@@ -109,8 +109,8 @@ Para evitar crescimento ilimitado do log em envios grandes, o arquivo ativo `tel
 
 - **Limite padrao:** 250 MB por arquivo (configuravel em Configuracoes: "Rotacao do storescu log (MB)").
 - **Retencao:** todos os arquivos rotacionados sao mantidos (sem remocao automatica nem compressao).
-- **Formato do nome dos segmentos:** `storescu_execucao.YYYYMMDD_HHMMSS.NNNNNN.log`
-  - Exemplo: `storescu_execucao.20260307_091746.000001.log`, `storescu_execucao.20260307_091831.000002.log`
+- **Formato do nome dos segmentos:** `storescu_execucao_2.log`, `storescu_execucao_3.log`, ...
+- **Compatibilidade:** o arquivo ativo sempre mantem o nome canônico `storescu_execucao.log`.
 - **Quando ocorre:** ao escrever uma nova linha, se o tamanho atual do arquivo ativo mais o tamanho da linha exceder o limite configurado, o arquivo ativo e renomeado para o formato acima e um novo `storescu_execucao.log` e aberto.
 - **Telemetria:** evento `LOG_ROTATE_CONFIG` no inicio do send; evento `LOG_ROTATE` a cada rotacao bem-sucedida (em `events.csv`).
 
@@ -180,7 +180,8 @@ No menu `Configuracao -> Configuracoes`:
   - opcao `Incluir arquivos sem extensao` (aplicada quando a restricao por extensao estiver ativa)
   - em `dcm4che + FOLDERS`, esse bloco fica inativo e a analise considera todos os arquivos para manter coerencia com o envio por pasta
 - Opcao de calcular `size_bytes` na analise (desmarcada por padrao para melhor performance)
-- Rotacao do storescu log (MB): limite em MB por arquivo de log ativo (padrao 250); arquivos rotacionados ficam com nome `storescu_execucao.YYYYMMDD_HHMMSS.NNNNNN.log`
+- Rotacao do storescu log (MB): limite em MB para `storescu_execucao.log` (padrao 250); segmentos com sufixo incremental (`_2`, `_3`, ...)
+- Rotacao dos arquivos internos (MB): limite em MB para os demais artefatos de texto (`csv`, `json`, `txt`, etc.) com o mesmo padrao incremental (`arquivo.ext`, `arquivo_2.ext`, ...)
 - Opcao de pre-checagem DICOM antes do send (dcmtk, desmarcada por padrao):
   - quando ligada, valida cada arquivo antes do envio (mais lento);
   - apenas erros fatais sao pulados automaticamente e registrados como `SEND_FAIL`;

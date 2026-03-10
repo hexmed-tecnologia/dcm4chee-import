@@ -146,6 +146,10 @@ class App(tk.Tk):
             cfg.storescu_log_rotate_max_mb = max(1, int(cfg.storescu_log_rotate_max_mb))
         except Exception:
             cfg.storescu_log_rotate_max_mb = 250
+        try:
+            cfg.internal_text_rotate_max_mb = max(1, int(getattr(cfg, "internal_text_rotate_max_mb", 250)))
+        except Exception:
+            cfg.internal_text_rotate_max_mb = 250
         raw_precheck = str(getattr(cfg, "send_precheck_before_send", False)).strip().lower()
         cfg.send_precheck_before_send = raw_precheck in {"1", "true", "yes", "on"}
         apply_internal_toolkit_paths(cfg, self.base_dir)
@@ -174,6 +178,7 @@ class App(tk.Tk):
             f"dcm4che_send_mode={cfg.dcm4che_send_mode} "
             f"dcm4che_iuid_update_mode={cfg.dcm4che_iuid_update_mode} "
             f"storescu_log_rotate_max_mb={cfg.storescu_log_rotate_max_mb} "
+            f"internal_text_rotate_max_mb={cfg.internal_text_rotate_max_mb} "
             f"send_precheck_before_send={'ON' if cfg.send_precheck_before_send else 'OFF'}"
         )
         self._log_an("Configuracoes atualizadas.")

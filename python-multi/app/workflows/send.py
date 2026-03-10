@@ -22,9 +22,12 @@ from app.domain.constants import (
 from app.infra.run_artifacts import (
     RUN_SUBDIR_TELEMETRY,
     cleanup_run_artifact_variants,
+    next_incremental_rotated_path,
     read_csv_rows,
+    rotate_text_artifact_if_needed,
     resolve_run_artifact_path,
     resolve_run_batch_args_dir,
+    set_internal_text_rotate_max_mb,
     write_csv_row,
     write_telemetry_event,
 )
@@ -199,6 +202,7 @@ class SendWorkflow:
             f"{self.cfg.aet_destino}@{self.cfg.pacs_host}:{self.cfg.pacs_port}",
             *[str(p) for p in batch_inputs],
         ]
+        rotate_text_artifact_if_needed(java_args_file, self._internal_rotate_max_bytes(), logger=self._log)
         with java_args_file.open("w", encoding="utf-8") as f:
             for token in tokens:
                 f.write(f"{_java_argfile_token(token)}\n")
@@ -234,6 +238,7 @@ class SendWorkflow:
     ) -> None:
         trace_file.parent.mkdir(parents=True, exist_ok=True)
         cmdline = format_command_line(cmd)
+        rotate_text_artifact_if_needed(trace_file, self._internal_rotate_max_bytes(), logger=self._log)
         with trace_file.open("w", encoding="utf-8") as f:
             f.write(f"chunk={chunk_index}/{total_chunks}\n")
             f.write(f"mode={cmd_mode}\n")
@@ -254,6 +259,12 @@ class SendWorkflow:
         if len(raw) <= max_chars:
             return raw
         return raw[: max_chars - 3] + "..."
+
+    def _internal_rotate_max_bytes(self) -> int:
+        try:
+            return max(1, int(getattr(self.cfg, "internal_text_rotate_max_mb", 250))) * 1024 * 1024
+        except Exception:
+            return 250 * 1024 * 1024
 
     def _dcmtk_precheck_dcmdump_path(self) -> Path | None:
         if not self.cfg.dcmtk_bin_path:
@@ -479,23 +490,17 @@ class SendWorkflow:
         chunk_cmd_dir.mkdir(parents=True, exist_ok=True)
 
         try:
+            internal_text_rotate_max_mb = max(1, int(getattr(self.cfg, "internal_text_rotate_max_mb", 250)))
+        except Exception:
+            internal_text_rotate_max_mb = 250
+        internal_text_rotate_max_bytes = set_internal_text_rotate_max_mb(internal_text_rotate_max_mb)
+        try:
             storescu_log_rotate_max_mb = max(1, int(getattr(self.cfg, "storescu_log_rotate_max_mb", 250)))
         except Exception:
             storescu_log_rotate_max_mb = 250
         storescu_log_rotate_max_bytes = storescu_log_rotate_max_mb * 1024 * 1024
-        storescu_log_rotation_seq = 0
         log_rotate_count = 0
         log_flush_calls_total = 0
-
-        def _next_rotated_storescu_log_path() -> Path:
-            nonlocal storescu_log_rotation_seq
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            base = log_file.stem
-            while True:
-                storescu_log_rotation_seq += 1
-                rotated = log_file.with_name(f"{base}.{ts}.{storescu_log_rotation_seq:06d}.log")
-                if not rotated.exists():
-                    return rotated
 
         self._log(
             f"[LOG_ROTATE_CONFIG] file={log_file} max_mb={storescu_log_rotate_max_mb} "
@@ -509,6 +514,20 @@ class SendWorkflow:
             (
                 f"file={log_file};max_mb={storescu_log_rotate_max_mb};"
                 f"max_bytes={storescu_log_rotate_max_bytes};retention=ALL;compression=OFF"
+            ),
+        )
+        self._log(
+            f"[INTERNAL_ROTATE_CONFIG] scope=send max_mb={internal_text_rotate_max_mb} "
+            f"max_bytes={internal_text_rotate_max_bytes}"
+        )
+        write_telemetry_event(
+            events,
+            run,
+            "INTERNAL_ROTATE_CONFIG",
+            "Configuracao de rotacao para artefatos internos aplicada.",
+            (
+                f"max_mb={internal_text_rotate_max_mb};max_bytes={internal_text_rotate_max_bytes};"
+                "pattern=base,_2,_3,_N"
             ),
         )
         write_telemetry_event(
@@ -805,6 +824,7 @@ class SendWorkflow:
 
         def _write_send_checkpoint(reason: str, file_path: str = "") -> None:
             checkpoint_done_units = item_cursor if send_unit_is_file_mode else unit_cursor
+            rotate_text_artifact_if_needed(checkpoint, self._internal_rotate_max_bytes(), logger=self._log)
             checkpoint.write_text(
                 json.dumps(
                     {
@@ -963,6 +983,7 @@ class SendWorkflow:
             )
 
             args_file = args_dir / f"batch_{chunk_index:06d}.txt"
+            rotate_text_artifact_if_needed(args_file, self._internal_rotate_max_bytes(), logger=self._log)
             with args_file.open("w", encoding="utf-8") as f:
                 for file_path in batch_files:
                     f.write(f"\"{file_path}\"\n")
@@ -1496,7 +1517,7 @@ class SendWorkflow:
                                 lf.close()
                             except Exception:
                                 pass
-                            rotated_path = _next_rotated_storescu_log_path()
+                            rotated_path = next_incremental_rotated_path(log_file)
                             rotate_error = ""
                             rotate_ok = False
                             try:
