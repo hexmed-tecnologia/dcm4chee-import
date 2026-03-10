@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -32,6 +33,83 @@ class ValidationWorkflow:
 
     def _log(self, msg: str) -> None:
         self.logger(msg)
+
+    def _validation_parallel_requests(self) -> int:
+        try:
+            raw_value = int(getattr(self.cfg, "validation_parallel_requests", 2))
+        except Exception:
+            raw_value = 2
+        return min(5, max(1, raw_value))
+
+    def _query_instance_dataset_safe(self, iuid: str) -> dict:
+        try:
+            return self._query_instance_dataset(iuid)
+        except Exception as ex:
+            return {
+                "api_found": 0,
+                "http_status": "ERR",
+                "detail": str(ex),
+                "dataset": {},
+            }
+
+    def _iter_iuid_queries(
+        self,
+        iuids: list[str],
+        *,
+        scope: str,
+        cancel_message: str,
+    ):
+        total = len(iuids)
+        workers = self._validation_parallel_requests()
+        self._log(
+            f"[VAL_PAR_CFG] scope={scope} parallel_requests={workers} "
+            f"iuid_total={total} retry=OFF timeout_sec=20"
+        )
+        if total == 0:
+            return
+
+        if workers == 1:
+            completed = 0
+            for iuid in iuids:
+                if self.cancel_event.is_set():
+                    raise RuntimeError(cancel_message)
+                completed += 1
+                yield iuid, self._query_instance_dataset_safe(iuid), completed, total
+            return
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="val_api") as executor:
+            pending: dict = {}
+            next_idx = 0
+
+            while next_idx < total and len(pending) < workers and not self.cancel_event.is_set():
+                iuid = iuids[next_idx]
+                next_idx += 1
+                pending[executor.submit(self._query_instance_dataset_safe, iuid)] = iuid
+
+            completed = 0
+            while pending:
+                if self.cancel_event.is_set():
+                    for fut in pending:
+                        fut.cancel()
+                    raise RuntimeError(cancel_message)
+
+                done, _ = wait(tuple(pending.keys()), timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+
+                for fut in done:
+                    iuid = pending.pop(fut)
+                    query = fut.result()
+                    completed += 1
+                    yield iuid, query, completed, total
+
+                    while next_idx < total and len(pending) < workers and not self.cancel_event.is_set():
+                        next_iuid = iuids[next_idx]
+                        next_idx += 1
+                        pending[executor.submit(self._query_instance_dataset_safe, next_iuid)] = next_iuid
+
+            if self.cancel_event.is_set():
+                raise RuntimeError(cancel_message)
 
     def _apply_internal_rotate_config(self, scope: str) -> None:
         try:
@@ -172,22 +250,42 @@ class ValidationWorkflow:
         self._log(f"[REPORT_EXPORT] Modo {mode} | IUIDs unicos para consulta: {len(unique_iuids)}")
 
         iuid_data: dict[str, dict] = {}
-        done = 0
-        for iuid in unique_iuids:
-            if self.cancel_event.is_set():
-                raise RuntimeError("Exportacao de relatorio cancelada.")
-            query = self._query_instance_dataset(iuid)
+        report_ok = 0
+        report_err = 0
+        report_api_err = 0
+        for iuid, query, done, total in self._iter_iuid_queries(
+            unique_iuids,
+            scope="report_export",
+            cancel_message="Exportacao de relatorio cancelada.",
+        ):
             fields = self._report_fields_from_dataset(query.get("dataset", {}))
             status = "OK" if query.get("api_found", 0) == 1 else "ERRO"
+            http_status = str(query.get("http_status", ""))
+            detail = str(query.get("detail", ""))
             iuid_data[iuid] = {
                 **fields,
                 "status": status,
-                "http_status": str(query.get("http_status", "")),
-                "detail": str(query.get("detail", "")),
+                "http_status": http_status,
+                "detail": detail,
             }
-            done += 1
-            if done % 100 == 0:
-                self._log(f"[REPORT_EXPORT_PROGRESS] {done}/{len(unique_iuids)} IUIDs consultados")
+            if status == "OK":
+                report_ok += 1
+            else:
+                report_err += 1
+                if http_status in ["ERR", ""]:
+                    report_api_err += 1
+                    self._log(
+                        f"[REPORT_API_ERROR] iuid={iuid} http_status={http_status or 'ERR'} "
+                        f"detail={detail or 'sem_detalhe'}"
+                    )
+            if done % 100 == 0 or done == total:
+                self._log(f"[REPORT_EXPORT_PROGRESS] {done}/{total} IUIDs consultados")
+
+        if report_api_err > 0:
+            self._log(
+                f"[REPORT_ALERT] Consultas REST com erro na exportacao: "
+                f"api_error={report_api_err} erro_total={report_err} ok={report_ok}"
+            )
 
         rows_a: list[dict] = []
         for rec in report_records:
@@ -416,26 +514,16 @@ class ValidationWorkflow:
         ok_count = 0
         miss_count = 0
         api_err_count = 0
-        for iuid, files in iuid_to_files.items():
-            if self.cancel_event.is_set():
-                raise RuntimeError("Validacao cancelada.")
-            url = f"http://{self.cfg.pacs_rest_host}/dcm4chee-arc/aets/{self.cfg.aet_destino}/rs/instances?SOPInstanceUID={iuid}"
-            api_found = 0
-            http_status = ""
-            detail = ""
-            try:
-                req = urlrequest.Request(url, method="GET")
-                with urlrequest.urlopen(req, timeout=20) as resp:
-                    http_status = str(resp.status)
-                    body = resp.read().decode("utf-8", errors="replace")
-                    data = json.loads(body) if body.strip() else []
-                    api_found = 1 if isinstance(data, list) and len(data) > 0 else 0
-            except urlerror.HTTPError as ex:
-                http_status = str(ex.code)
-                detail = str(ex)
-            except Exception as ex:
-                http_status = "ERR"
-                detail = str(ex)
+        iuid_list = list(iuid_to_files.keys())
+        for iuid, query, processed_count, processed_total in self._iter_iuid_queries(
+            iuid_list,
+            scope="run_validation",
+            cancel_message="Validacao cancelada.",
+        ):
+            files = iuid_to_files.get(iuid, [])
+            api_found = 1 if query.get("api_found", 0) == 1 else 0
+            http_status = str(query.get("http_status", ""))
+            detail = str(query.get("detail", ""))
 
             if api_found == 1:
                 ok_count += 1
@@ -446,6 +534,11 @@ class ValidationWorkflow:
                     miss_count += 1
 
             status = "OK" if api_found == 1 else ("API_ERROR" if http_status in ["ERR", ""] else "NOT_FOUND")
+            if status == "API_ERROR":
+                self._log(
+                    f"[VAL_API_ERROR] iuid={iuid} http_status={http_status or 'ERR'} "
+                    f"detail={detail or 'sem_detalhe'}"
+                )
             for fp in files:
                 write_csv_row(
                     validation_results,
@@ -462,9 +555,9 @@ class ValidationWorkflow:
                     },
                     validation_fields,
                 )
-            if (ok_count + miss_count + api_err_count) % 100 == 0:
+            if processed_count % 100 == 0 or processed_count == processed_total:
                 self._log(
-                    f"Progresso validacao API: {ok_count + miss_count + api_err_count}/{len(iuid_to_files)} "
+                    f"Progresso validacao API: {processed_count}/{processed_total} "
                     f"(ok={ok_count}, nf={miss_count}, api_err={api_err_count})"
                 )
 
@@ -523,6 +616,11 @@ class ValidationWorkflow:
         self._log(f"IUIDs OK: {ok_count}")
         self._log(f"IUIDs NOT_FOUND: {miss_count}")
         self._log(f"IUIDs API_ERROR: {api_err_count}")
+        if api_err_count > 0 or miss_count > 0 or fail_count > 0:
+            self._log(
+                f"[VAL_ALERT] Inconsistencias detectadas: "
+                f"iuid_not_found={miss_count} iuid_api_error={api_err_count} send_fail={fail_count}"
+            )
         self._log(f"[VAL_END] run_id={run} status={final_status} duration={format_duration_sec(validation_duration_sec)}")
         write_telemetry_event(
             events,

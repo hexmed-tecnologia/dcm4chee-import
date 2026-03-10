@@ -110,12 +110,14 @@ class App(tk.Tk):
         self.activity_status_an = tk.StringVar(value="ocioso")
         self.activity_status_send = tk.StringVar(value="ocioso")
         self.activity_status_val = tk.StringVar(value="ocioso")
+        self.validation_parallel_status_val = tk.StringVar(value="")
         self._activity_context = ""
         self._activity_running = False
         self._activity_bars: list[ttk.Progressbar] = []
         self._batch_size_max_cmd_limit: int | None = None
         self._batch_size_max_cmd_source = ""
         self._batch_size_trace_guard = False
+        self._refresh_validation_parallel_indicator()
 
         self._build_menu()
         self._setup_ui_styles()
@@ -150,6 +152,10 @@ class App(tk.Tk):
             cfg.internal_text_rotate_max_mb = max(1, int(getattr(cfg, "internal_text_rotate_max_mb", 250)))
         except Exception:
             cfg.internal_text_rotate_max_mb = 250
+        try:
+            cfg.validation_parallel_requests = min(5, max(1, int(getattr(cfg, "validation_parallel_requests", 2))))
+        except Exception:
+            cfg.validation_parallel_requests = 2
         raw_precheck = str(getattr(cfg, "send_precheck_before_send", False)).strip().lower()
         cfg.send_precheck_before_send = raw_precheck in {"1", "true", "yes", "on"}
         apply_internal_toolkit_paths(cfg, self.base_dir)
@@ -169,6 +175,7 @@ class App(tk.Tk):
         self.var_batch_size.set(str(cfg.batch_size_default))
         self._batch_size_max_cmd_limit = None
         self._batch_size_max_cmd_source = ""
+        self._refresh_validation_parallel_indicator()
         self._log_an(
             f"[CFG_SAVE] toolkit={cfg.toolkit} aet_origem={cfg.aet_origem} aet_destino={cfg.aet_destino} "
             f"pacs_dicom={cfg.pacs_host}:{cfg.pacs_port} pacs_rest={cfg.pacs_rest_host} "
@@ -179,6 +186,7 @@ class App(tk.Tk):
             f"dcm4che_iuid_update_mode={cfg.dcm4che_iuid_update_mode} "
             f"storescu_log_rotate_max_mb={cfg.storescu_log_rotate_max_mb} "
             f"internal_text_rotate_max_mb={cfg.internal_text_rotate_max_mb} "
+            f"validation_parallel_requests={cfg.validation_parallel_requests} "
             f"send_precheck_before_send={'ON' if cfg.send_precheck_before_send else 'OFF'}"
         )
         self._log_an("Configuracoes atualizadas.")
@@ -391,6 +399,9 @@ class App(tk.Tk):
             state="readonly",
         ).grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
         ttk.Button(top, text="Exportar relatorio completo", command=self._start_export_report).grid(row=1, column=3, padx=4, pady=(8, 0))
+        ttk.Label(top, textvariable=self.validation_parallel_status_val).grid(
+            row=2, column=0, columnspan=5, sticky="w", pady=(8, 0)
+        )
         activity = ttk.Frame(self.tab_val, padding=(10, 0, 10, 4))
         activity.pack(fill="x")
         ttk.Label(activity, text="Atividade:").pack(side="left")
@@ -821,6 +832,17 @@ class App(tk.Tk):
     def _on_send_run_selected(self) -> None:
         self._apply_batch_limit_for_run(self.var_send_run.get().strip(), notify=False, auto_set=True)
 
+    def _current_validation_parallel_requests(self) -> int:
+        try:
+            return min(5, max(1, int(getattr(self.config_obj, "validation_parallel_requests", 2))))
+        except Exception:
+            return 2
+
+    def _refresh_validation_parallel_indicator(self, mode_context: str = "") -> None:
+        parallel = self._current_validation_parallel_requests()
+        context = f" | modo: {mode_context}" if mode_context else ""
+        self.validation_parallel_status_val.set(f"Consultas REST paralelas: {parallel}{context}")
+
     def _set_activity_context(self, context: str) -> None:
         self._activity_context = (context or "").strip()
 
@@ -840,6 +862,7 @@ class App(tk.Tk):
             for bar in self._activity_bars:
                 bar.stop()
             self._activity_context = ""
+            self._refresh_validation_parallel_indicator()
         self._activity_running = running
 
     def _sync_activity_indicator(self) -> None:
@@ -1050,6 +1073,7 @@ class App(tk.Tk):
         if not run_id:
             messagebox.showerror("Erro", "Informe run_id.")
             return
+        self._refresh_validation_parallel_indicator(mode_context="validacao")
         self.cancel_event.clear()
         self._log_val("[VAL_START] Iniciando validacao...")
         self._set_activity_context("Validacao")
@@ -1076,6 +1100,7 @@ class App(tk.Tk):
             return
         mode_label = self.var_report_mode.get().strip()
         mode = "A" if mode_label.upper().startswith("A") else "C"
+        self._refresh_validation_parallel_indicator(mode_context=f"relatorio {mode}")
         self.cancel_event.clear()
         self._log_val(f"[REPORT_START] Iniciando exportacao do relatorio completo (modo {mode})...")
         self._set_activity_context("Exportacao de relatorio")

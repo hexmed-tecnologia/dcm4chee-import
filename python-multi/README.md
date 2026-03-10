@@ -152,6 +152,9 @@ No menu `Configuracao -> Configuracoes`:
 - AET origem (padrao: `HMD_IMPORTER`), AET destino
 - PACS DICOM host (C-STORE) e PACS DICOM port (C-STORE)
 - Host REST para validacao
+- Consultas REST paralelas na validacao (1-5, padrao 2)
+  - aplicado na aba `Validacao` tanto em `Validar Run` quanto em `Exportar relatorio completo`
+  - sem retry automatico nesta versao (erros de API ficam destacados no log com `[VAL_API_ERROR]` e no resumo com `[VAL_ALERT]`)
 - Tamanho de batch
   - para `dcm4che`, o envio usa `JAVA_DIRECT` com `@argfile` (evita limitacao do `cmd`)
   - no `JAVA_DIRECT`, os argumentos do `@argfile` sao serializados com escape explicito de barra invertida para suportar paths Windows com espacos

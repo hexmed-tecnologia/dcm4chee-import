@@ -32,6 +32,9 @@ class ConfigDialog(tk.Toplevel):
         self.var_internal_text_rotate_max_mb = tk.StringVar(
             value=str(int(getattr(config, "internal_text_rotate_max_mb", 250)))
         )
+        self.var_validation_parallel_requests = tk.StringVar(
+            value=str(int(getattr(config, "validation_parallel_requests", 2)))
+        )
         self.var_send_precheck_before_send = tk.BooleanVar(value=bool(config.send_precheck_before_send))
 
         frm = ttk.Frame(self, padding=12)
@@ -69,9 +72,10 @@ class ConfigDialog(tk.Toplevel):
         self.cmb_dcm4che_iuid_mode.grid(row=7, column=1, sticky="we", pady=3)
         self._row_entry(frm, 8, "Rotacao do storescu log (MB)", self.var_storescu_log_rotate_max_mb)
         self._row_entry(frm, 9, "Rotacao dos arquivos internos (MB)", self.var_internal_text_rotate_max_mb)
+        self._row_entry(frm, 10, "Consultas REST paralelas na validacao (1-5)", self.var_validation_parallel_requests)
 
         self.filter_frame = ttk.LabelFrame(frm, text="Filtro de arquivos para analise", padding=8)
-        self.filter_frame.grid(row=10, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.filter_frame.grid(row=11, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.filter_frame.columnconfigure(1, weight=1)
         self.chk_include_all = ttk.Checkbutton(
             self.filter_frame,
@@ -95,16 +99,16 @@ class ConfigDialog(tk.Toplevel):
             frm,
             text="Calcular size_bytes na analise (mais lento)",
             variable=self.var_collect_size,
-        ).grid(row=11, column=0, columnspan=2, sticky="w")
+        ).grid(row=12, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(
             frm,
             text="Pre-checagem DICOM antes do send (dcmtk, mais lento)",
             variable=self.var_send_precheck_before_send,
-        ).grid(row=12, column=0, columnspan=2, sticky="w")
+        ).grid(row=13, column=0, columnspan=2, sticky="w")
         self._toggle_dcm4che_controls()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=13, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        btns.grid(row=14, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(btns, text="Testar Echo", command=self._test_echo).pack(side="left", padx=4)
         ttk.Button(btns, text="Salvar", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="Fechar", command=self.destroy).pack(side="left", padx=4)
@@ -165,6 +169,9 @@ class ConfigDialog(tk.Toplevel):
         internal_text_rotate_max_mb = int(self.var_internal_text_rotate_max_mb.get().strip())
         if internal_text_rotate_max_mb < 1:
             raise ValueError("Rotacao dos arquivos internos (MB) deve ser >= 1.")
+        validation_parallel_requests = int(self.var_validation_parallel_requests.get().strip())
+        if validation_parallel_requests < 1 or validation_parallel_requests > 5:
+            raise ValueError("Consultas REST paralelas na validacao deve estar entre 1 e 5.")
         return AppConfig(
             toolkit=self.var_toolkit.get().strip(),
             aet_origem=self.var_aet_src.get().strip(),
@@ -182,6 +189,7 @@ class ConfigDialog(tk.Toplevel):
             dcm4che_iuid_update_mode=normalize_dcm4che_iuid_update_mode(self.var_dcm4che_iuid_update_mode.get().strip()),
             storescu_log_rotate_max_mb=storescu_log_rotate_max_mb,
             internal_text_rotate_max_mb=internal_text_rotate_max_mb,
+            validation_parallel_requests=validation_parallel_requests,
             send_precheck_before_send=bool(self.var_send_precheck_before_send.get()),
         )
 

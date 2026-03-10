@@ -24,6 +24,8 @@ class AppConfig:
     dcm4che_iuid_update_mode: str = "REALTIME"
     storescu_log_rotate_max_mb: int = 250
     internal_text_rotate_max_mb: int = 250
+    # Parallel REST requests for validation/report queries (bounded for operational safety).
+    validation_parallel_requests: int = 2
     # Optional safety check before sending each file with dcmtk (can be slow on large runs).
     send_precheck_before_send: bool = False
     # Prefer direct Java launcher with @argfile on Windows to avoid cmd line-length bottlenecks.
