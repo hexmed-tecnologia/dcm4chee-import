@@ -111,6 +111,11 @@ class App(tk.Tk):
         self.activity_status_send = tk.StringVar(value="ocioso")
         self.activity_status_val = tk.StringVar(value="ocioso")
         self.validation_parallel_status_val = tk.StringVar(value="")
+        self.validation_timing_status_val = tk.StringVar(value="Tempo validacao: aguardando execucao")
+        self._validation_timer_running = False
+        self._validation_timer_started_at = 0.0
+        self._validation_timer_parallel = 0
+        self._validation_perf_by_parallel: dict[int, float] = {}
         self._activity_context = ""
         self._activity_running = False
         self._activity_bars: list[ttk.Progressbar] = []
@@ -401,6 +406,9 @@ class App(tk.Tk):
         ttk.Button(top, text="Exportar relatorio completo", command=self._start_export_report).grid(row=1, column=3, padx=4, pady=(8, 0))
         ttk.Label(top, textvariable=self.validation_parallel_status_val).grid(
             row=2, column=0, columnspan=5, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(top, textvariable=self.validation_timing_status_val).grid(
+            row=3, column=0, columnspan=5, sticky="w", pady=(4, 0)
         )
         activity = ttk.Frame(self.tab_val, padding=(10, 0, 10, 4))
         activity.pack(fill="x")
@@ -843,6 +851,64 @@ class App(tk.Tk):
         context = f" | modo: {mode_context}" if mode_context else ""
         self.validation_parallel_status_val.set(f"Consultas REST paralelas: {parallel}{context}")
 
+    def _validation_perf_snapshot_text(self) -> str:
+        if not self._validation_perf_by_parallel:
+            return ""
+        entries = []
+        for parallel in sorted(self._validation_perf_by_parallel.keys()):
+            duration = float(self._validation_perf_by_parallel.get(parallel, 0.0))
+            entries.append(f"{parallel}T={format_duration_sec(duration)}")
+        return "Historico: " + " | ".join(entries)
+
+    def _validation_gain_vs_single_thread_text(self, parallel: int, duration_sec: float) -> str:
+        baseline = self._validation_perf_by_parallel.get(1)
+        if baseline is None or baseline <= 0 or parallel <= 1:
+            return ""
+        delta = baseline - duration_sec
+        pct = (abs(delta) / baseline) * 100.0
+        if delta >= 0:
+            return f"Ganho vs 1T: {pct:.1f}%"
+        return f"Perda vs 1T: {pct:.1f}%"
+
+    def _start_validation_timer(self, parallel: int) -> None:
+        self._validation_timer_parallel = max(1, int(parallel))
+        self._validation_timer_started_at = time.monotonic()
+        self._validation_timer_running = True
+        self.validation_timing_status_val.set(
+            f"Tempo validacao (em execucao): 0.0s | paralelo={self._validation_timer_parallel}"
+        )
+
+    def _tick_validation_timer(self) -> None:
+        if not self._validation_timer_running:
+            return
+        elapsed = max(time.monotonic() - self._validation_timer_started_at, 0.0)
+        self.validation_timing_status_val.set(
+            f"Tempo validacao (em execucao): {format_duration_sec(elapsed)} | paralelo={self._validation_timer_parallel}"
+        )
+
+    def _stop_validation_timer(self, *, status: str, duration_sec: float | None = None) -> None:
+        if not self._validation_timer_running and duration_sec is None:
+            return
+        if duration_sec is None:
+            duration_sec = max(time.monotonic() - self._validation_timer_started_at, 0.0)
+        duration = max(float(duration_sec), 0.0)
+        parallel = max(1, int(self._validation_timer_parallel or self._current_validation_parallel_requests()))
+        self._validation_perf_by_parallel[parallel] = duration
+        self._validation_timer_running = False
+        self._validation_timer_started_at = 0.0
+        gain_text = self._validation_gain_vs_single_thread_text(parallel, duration)
+        snapshot = self._validation_perf_snapshot_text()
+        parts = [
+            f"Tempo ultima validacao: {format_duration_sec(duration)}",
+            f"paralelo={parallel}",
+            f"status={status}",
+        ]
+        if gain_text:
+            parts.append(gain_text)
+        if snapshot:
+            parts.append(snapshot)
+        self.validation_timing_status_val.set(" | ".join(parts))
+
     def _set_activity_context(self, context: str) -> None:
         self._activity_context = (context or "").strip()
 
@@ -1073,7 +1139,9 @@ class App(tk.Tk):
         if not run_id:
             messagebox.showerror("Erro", "Informe run_id.")
             return
+        parallel = self._current_validation_parallel_requests()
         self._refresh_validation_parallel_indicator(mode_context="validacao")
+        self._start_validation_timer(parallel)
         self.cancel_event.clear()
         self._log_val("[VAL_START] Iniciando validacao...")
         self._set_activity_context("Validacao")
@@ -1777,13 +1845,26 @@ class App(tk.Tk):
                     self._refresh_run_list()
                 elif event == "val_done":
                     val_duration = payload.get("validation_duration_sec")
+                    try:
+                        val_parallel = max(
+                            1,
+                            int(payload.get("validation_parallel_requests") or self._validation_timer_parallel or 1),
+                        )
+                    except Exception:
+                        val_parallel = max(1, int(self._validation_timer_parallel or 1))
+                    self._validation_timer_parallel = val_parallel
                     if val_duration is not None:
                         self._log_val(
                             f"[VAL_END] Run ID: {payload.get('run_id')} | Status: {payload.get('status')} | "
                             f"Duracao: {format_duration_sec(float(val_duration))}"
                         )
+                        self._stop_validation_timer(
+                            status=str(payload.get("status", "OK")),
+                            duration_sec=float(val_duration),
+                        )
                     else:
                         self._log_val(f"[VAL_END] Run ID: {payload.get('run_id')} | Status: {payload.get('status')}")
+                        self._stop_validation_timer(status=str(payload.get("status", "OK")))
                     self._refresh_run_list()
                 elif event == "report_done":
                     self._log_val(
@@ -1805,12 +1886,16 @@ class App(tk.Tk):
                     messagebox.showerror("Erro no SEND", payload)
                 elif event == "val_error":
                     self._log_val(f"[ERRO] {payload}")
+                    payload_text = str(payload or "")
+                    status = "CANCELADA" if "cancel" in payload_text.lower() else "ERRO"
+                    self._stop_validation_timer(status=status)
                     messagebox.showerror("Erro na VALIDACAO", payload)
                 elif event == "report_error":
                     self._log_val(f"[ERRO] {payload}")
                     messagebox.showerror("Erro na exportacao do relatorio", payload)
         except queue.Empty:
             pass
+        self._tick_validation_timer()
         self._sync_activity_indicator()
         self._reconcile_send_tail_state()
         self.after(120, self._poll_queue)

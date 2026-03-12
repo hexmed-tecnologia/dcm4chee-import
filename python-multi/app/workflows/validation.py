@@ -402,6 +402,7 @@ class ValidationWorkflow:
 
     def run_validation(self, run_id: str) -> dict:
         validation_start_ts = time.monotonic()
+        parallel_requests = self._validation_parallel_requests()
         run = run_id.strip()
         if not run:
             raise RuntimeError("run_id e obrigatorio para validacao.")
@@ -633,4 +634,10 @@ class ValidationWorkflow:
                 f"validation_duration_sec={validation_duration_sec}"
             ),
         )
-        return {"run_id": run, "status": final_status, "run_dir": str(run_dir), "validation_duration_sec": validation_duration_sec}
+        return {
+            "run_id": run,
+            "status": final_status,
+            "run_dir": str(run_dir),
+            "validation_duration_sec": validation_duration_sec,
+            "validation_parallel_requests": parallel_requests,
+        }
